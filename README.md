@@ -115,11 +115,25 @@ println!("{report}");
 ```
 
 The public API exposes feature statuses, typed proof trees, costs and source
-references. `check_proof(source, &proof)` verifies a witness without asserting
-that it is minimal. `syntax::parse` preserves semantic descriptions in its AST.
+references. `ValidationReport::types` owns the shared `TypeStore`: type nodes,
+the nominal declaration registry, and cached structural views. Nodes reference
+their children through `TypeId`, and interning gives equal normalized types the
+same identifier. Identifiers belong to one store; they cannot be compared across
+independent validation runs. Use `report.types[id]` to inspect a node and
+`report.types.display(id)` to format a type.
+
+`ValidationReport::proofs` owns the `ProofStore`. Feature results contain
+`ProofId` roots; inference children are identifiers in the same store.
+Use `report.proofs[id]` to inspect a record and
+`report.proofs.expression(id, &report.types)` to format a witness.
+`check_proof(source, &report.types, &report.proofs, id)` verifies it without
+asserting minimality, translating its type and proof identifiers into independent
+stores. Externally constructed records can be added with `ProofStore::insert`;
+the checker rejects invalid rules, costs, missing children, and cycles.
+`syntax::parse` preserves semantic descriptions in its AST.
 
 - `src/syntax.rs`: line lexer and recursive descent parser.
-- `src/model.rs`: nominal type model, finite elaboration, trait lowering,
+- `src/model.rs`: interned type graph and declaration registry, finite elaboration, trait lowering,
   cycle detection, existential normalization and overload intersection checks.
 - `src/search.rs`: type-universe construction and an indexed weighted agenda.
 - `src/proof.rs`: typed proof nodes, inference premises and witness checking.
@@ -131,9 +145,12 @@ Unary rules and collection lifts are indexed by premise pairs; composition uses
 incoming/outgoing indexes and fanout uses admitted product targets. Every parent
 has greater lexicographic cost than either premise, so the first settled cost
 for a pair is minimal. Equal-cost alternatives are bounded and deduplicated.
-Proofs share storage with `Arc`, but costs count occurrences in the unfolded
-tree. Search stops after all goal costs and their retained alternatives are
-settled, or after exhausting the relation or work budget.
+Proofs share premise identifiers in an interned DAG, but costs count occurrences
+in the unfolded tree. Rejected candidates are not stored. Search stops after all
+goal costs and their retained alternatives are settled, or after exhausting the
+relation or work budget. Before returning the report, the proof store is compacted
+to the reported roots and their reachable premises. The parser's existential AST
+uses uniquely owned boxes; semantic types and proofs use indexed stores.
 
 STN validates type-level derivability. Prose contracts, algorithms, value equality,
 mutable-state coordination, and representation choices remain implementation

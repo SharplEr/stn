@@ -15,8 +15,12 @@ fn costs(report: &ValidationReport) -> Vec<Cost> {
         .map(|f| match &f.status {
             FeatureStatus::Proved { proofs } => {
                 assert!(!proofs.is_empty());
-                assert!(proofs.iter().all(|p| p.cost == proofs[0].cost));
-                proofs[0].cost
+                assert!(
+                    proofs
+                        .iter()
+                        .all(|p| report.proofs[*p].cost == report.proofs[proofs[0]].cost)
+                );
+                report.proofs[proofs[0]].cost
             }
             status => panic!("{}: {status:?}", f.name),
         })
@@ -46,7 +50,10 @@ fn composition_returns_only_equal_minima() {
         unreachable!()
     };
     assert_eq!(proofs.len(), 2);
-    assert_ne!(proofs[0].expression(), proofs[1].expression());
+    assert_ne!(
+        report.proofs.expression(proofs[0], &report.types),
+        report.proofs.expression(proofs[1], &report.types)
+    );
 }
 
 #[test]
@@ -151,7 +158,12 @@ fn lifts_collections_and_flatmaps_lists() {
     let FeatureStatus::Proved { proofs } = &report.features[3].status else {
         unreachable!()
     };
-    assert!(proofs.iter().any(|p| p.expression().starts_with("flatMap")));
+    assert!(proofs.iter().any(|p| {
+        report
+            .proofs
+            .expression(*p, &report.types)
+            .starts_with("flatMap")
+    }));
 }
 
 #[test]
@@ -372,18 +384,19 @@ fn proof_alternative_limit_is_respected_and_results_are_deterministic() {
 
 #[test]
 fn external_checker_rejects_an_incorrect_cost_and_rule() {
-    use std::sync::Arc;
     use stn_validator::{ProofNode, Rule, check_proof};
     let source = "DEFINITIONS:\nA\nB\nf: A -> B\nFEATURES:\ng: A -> B\n";
     let report = validate_source("input", source, &ValidationOptions::default()).unwrap();
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
-    check_proof(source, &proofs[0]).unwrap();
-    let mut wrong_cost = proofs[0].as_ref().clone();
+    check_proof(source, &report.types, &report.proofs, proofs[0]).unwrap();
+    let mut wrong_cost = report.proofs[proofs[0]].clone();
     wrong_cost.cost.functions = 0;
-    assert!(check_proof(source, &Arc::new(wrong_cost)).is_err());
-    let mut wrong_rule = proofs[0].as_ref().clone();
+    let mut edited = report.proofs.clone();
+    let wrong_cost = edited.insert(wrong_cost);
+    assert!(check_proof(source, &report.types, &edited, wrong_cost).is_err());
+    let mut wrong_rule = report.proofs[proofs[0]].clone();
     wrong_rule.node = ProofNode::Inference {
         rule: Rule::Identity,
         children: Vec::new(),
@@ -392,7 +405,8 @@ fn external_checker_rejects_an_incorrect_cost_and_rule() {
         functions: 0,
         rules: 1,
     };
-    assert!(check_proof(source, &Arc::new(wrong_rule)).is_err());
+    let wrong_rule = edited.insert(wrong_rule);
+    assert!(check_proof(source, &report.types, &edited, wrong_rule).is_err());
 }
 
 #[test]
@@ -420,7 +434,12 @@ fn nominal_flatmap_exposes_a_nominal_element_result_with_an_explicit_view() {
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
-    assert!(proofs[0].expression().contains("view"));
+    assert!(
+        report
+            .proofs
+            .expression(proofs[0], &report.types)
+            .contains("view")
+    );
 }
 
 #[test]

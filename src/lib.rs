@@ -5,9 +5,9 @@ pub mod proof;
 mod search;
 pub mod syntax;
 
-pub use model::Type;
-pub use proof::{Cost, Proof, ProofNode, Rule};
-use std::{fmt, sync::Arc};
+pub use model::{Type, TypeDisplay, TypeId, TypeStore};
+pub use proof::{Cost, Proof, ProofId, ProofNode, ProofStore, Rule};
+use std::fmt;
 
 /// Selects the admitted intermediate types and bounds proof-search resources.
 /// Explicitly declared shapes remain available regardless of the depth bound.
@@ -79,14 +79,14 @@ pub enum FeatureStatus {
     /// Minimum cost within the selected finite universe, independently checked.
     Proved {
         /// Retained distinct witnesses, all with the same minimum cost.
-        proofs: Vec<Arc<Proof>>,
+        proofs: Vec<ProofId>,
     },
     /// The selected universe was exhausted without a derivation of the goal.
     UnresolvableWithinUniverse {
         /// Explanation of the missing transformation or incompatible types.
         reason: String,
         /// A bounded sample of outputs reachable from the feature input.
-        reachable: Vec<Type>,
+        reachable: Vec<TypeId>,
     },
     /// A resource limit or failed witness check prevensourceted certification.
     SearchIncomplete {
@@ -101,9 +101,9 @@ pub struct FeatureReport {
     /// Feature name, including concrete parameter substitutions when present.
     pub name: String,
     /// Logical input available to the proof search.
-    pub input: Type,
+    pub input: TypeId,
     /// Exact semantic output required by the feature.
-    pub output: Type,
+    pub output: TypeId,
     /// One-based line of the original feature declaration.
     pub line: usize,
     /// Checked witnesses or diagnostics for this ground goal.
@@ -113,6 +113,10 @@ pub struct FeatureReport {
 /// Its display representation is the text report written by the CLI.
 #[derive(Clone, Debug)]
 pub struct ValidationReport {
+    /// Store owning every type identifier in the report and its proof DAGs.
+    pub types: TypeStore,
+    /// Store owning the proof identifiers reported for feature goals.
+    pub proofs: ProofStore,
     /// Synthesized tuple-width bound inferred from declarations and trait lowering.
     pub max_tuple_arity: usize,
     /// Source label supplied at construction, normally the input path in the CLI.
@@ -161,7 +165,11 @@ impl fmt::Display for ValidationReport {
             writeln!(
                 f,
                 "\n{}:{}: {}: {} -> {}",
-                self.source_name, feature.line, feature.name, feature.input, feature.output
+                self.source_name,
+                feature.line,
+                feature.name,
+                self.types.display(feature.input),
+                self.types.display(feature.output)
             )?;
             match &feature.status {
                 FeatureStatus::Proved { proofs } => {
@@ -174,9 +182,9 @@ impl fmt::Display for ValidationReport {
                         writeln!(
                             f,
                             "  [{}, {}] {}",
-                            p.cost.functions,
-                            p.cost.rules,
-                            p.expression()
+                            self.proofs[*p].cost.functions,
+                            self.proofs[*p].cost.rules,
+                            self.proofs.expression(*p, &self.types)
                         )?;
                     }
                 }
@@ -196,7 +204,7 @@ impl fmt::Display for ValidationReport {
                             "  reachable (up to 16): {}",
                             reachable
                                 .iter()
-                                .map(ToString::to_string)
+                                .map(|t| self.types.display(*t).to_string())
                                 .collect::<Vec<_>>()
                                 .join("; ")
                         )?;
@@ -232,11 +240,12 @@ pub fn validate_source(
     let document = syntax::parse(source)?;
     let model::Specification {
         tuple_arity,
-        types,
+        mut types,
         primitives,
         features,
     } = model::elaborate(&document)?;
-    let statuses = search::search(&primitives, &features, &types, options, tuple_arity);
+    let (proofs, statuses) =
+        search::search(&primitives, &features, &mut types, options, tuple_arity);
     let reports = features
         .into_iter()
         .zip(statuses)
@@ -249,7 +258,7 @@ pub fn validate_source(
                     feature
                         .substitutions
                         .iter()
-                        .map(|(n, t)| format!("{n}={t}"))
+                        .map(|(n, t)| format!("{n}={}", types.display(*t)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -264,6 +273,8 @@ pub fn validate_source(
         })
         .collect();
     Ok(ValidationReport {
+        types,
+        proofs,
         max_tuple_arity: tuple_arity,
         source_name: source_name.into(),
         options: options.clone(),
@@ -273,10 +284,25 @@ pub fn validate_source(
 
 /// Verify an externally stored or modified witness against a specification.
 /// This checks semantic rule instances and costs, independently of search
-/// limits. It does not assert that the proof has minimum cost.
-pub fn check_proof(source: &str, proof: &Arc<Proof>) -> Result<(), ValidationError> {
+/// limits. It does not assert that the proof has minimum cost. Type identifiers
+/// and proof identifiers are translated from the supplied stores into an
+/// independently elaborated source model and a separate proof DAG.
+pub fn check_proof(
+    source: &str,
+    types: &TypeStore,
+    proofs: &ProofStore,
+    root: ProofId,
+) -> Result<(), ValidationError> {
     let document = syntax::parse(source)?;
-    let specification = model::elaborate(&document)?;
-    proof::check(proof, &specification.primitives, &specification.types)
-        .map_err(ValidationError::Invalid)
+    let mut specification = model::elaborate(&document)?;
+    let mut imported = ProofStore::default();
+    let root = proof::import(root, types, proofs, &mut specification.types, &mut imported)
+        .map_err(ValidationError::Invalid)?;
+    proof::check(
+        root,
+        &imported,
+        &specification.primitives,
+        &specification.types,
+    )
+    .map_err(ValidationError::Invalid)
 }

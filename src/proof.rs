@@ -1,14 +1,14 @@
 //! Typed proof witnesses and a checker independent of the search agenda.
-use crate::Type;
-use crate::model::{self, Primitive, TypeInfo};
+use crate::model::Primitive;
+use crate::{Type, TypeId, TypeStore};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::Arc,
+    ops::Index,
 };
 
 /// Lexicographic simplicity: occurrences of primitives, then inference nodes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Cost {
     /// Number of user-function occurrences in the unfolded proof tree.
     pub functions: usize,
@@ -18,7 +18,7 @@ pub struct Cost {
 
 /// Inference operation recorded by a proof node.
 /// Rule premises depend on the node's endpoints and ordered child proofs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Rule {
     /// Return the logical input with the same semantic type.
     Identity,
@@ -72,9 +72,9 @@ impl fmt::Display for Rule {
 }
 
 /// Evidence for a single step: a source morphism or an inference application.
-/// Inference children are ordered and shared with `Arc`; checking verifies their
+/// Inference children are ordered identifiers in the same store; checking verifies their
 /// number, endpoint types, and rule-specific premises.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ProofNode {
     /// One ground specialization of a morphism declared in `DEFINITIONS`.
     Primitive {
@@ -87,74 +87,111 @@ pub enum ProofNode {
         /// Preserved semantic description of the source morphism.
         description: String,
         /// Concrete choices for its finite declaration and trait parameters.
-        substitutions: BTreeMap<String, Type>,
+        substitutions: BTreeMap<String, TypeId>,
     },
     /// A structural step justified by zero, one, or two child proofs.
     Inference {
         /// Inference operation whose premises the checker must validate.
         rule: Rule,
         /// Ordered premises; composition uses execution order and fanout uses tuple order.
-        children: Vec<Arc<Proof>>,
+        children: Vec<ProofId>,
     },
 }
 
 /// Typed witness of a morphism from `input` to `output`, with its simplicity cost.
 /// Storage can form a shared DAG, but cost counts the unfolded tree's occurrences.
 /// Construction by search is followed by an independent semantic witness check.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Proof {
     /// Exact semantic input accepted by this proof node.
-    pub input: Type,
+    pub input: TypeId,
     /// Exact semantic output established by this proof node.
-    pub output: Type,
+    pub output: TypeId,
     /// Lexicographic cost including the node and all child occurrences.
     pub cost: Cost,
     /// Primitive reference or inference step justifying the endpoints.
     pub node: ProofNode,
 }
-impl Proof {
-    pub(crate) fn primitive(id: usize, p: &Primitive) -> Arc<Self> {
-        Arc::new(Self {
-            input: p.input.clone(),
-            output: p.output.clone(),
-            cost: Cost {
-                functions: 1,
-                rules: 0,
-            },
-            node: ProofNode::Primitive {
-                id,
-                name: p.name.clone(),
-                line: p.line,
-                description: p.description.clone(),
-                substitutions: p.substitutions.clone(),
-            },
-        })
+
+/// Index of an immutable proof node in its owning `ProofStore`.
+/// Identifiers are cheap to copy and must be used with the store that issued them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ProofId(usize);
+
+/// Owner of a proof DAG; nodes refer to shared premises through `ProofId`.
+/// Equal records reuse an identifier. The search retains only records reachable
+/// from reported roots when it transfers this store into the validation report.
+#[derive(Clone, Debug, Default)]
+pub struct ProofStore {
+    /// Canonical proof records, indexed by their identifiers.
+    nodes: Vec<Proof>,
+    /// Lookup keys contain immediate child identifiers, never recursive proofs.
+    interned: HashMap<Proof, ProofId>,
+}
+
+impl ProofStore {
+    /// Number of proof records owned by the store.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
     }
+
+    /// Whether the store contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Look up a record using an identifier originating from this store.
+    pub fn get(&self, id: ProofId) -> Option<&Proof> {
+        self.nodes.get(id.0)
+    }
+
+    /// Find an existing record; child identifiers must belong to this store.
+    pub fn find(&self, proof: &Proof) -> Option<ProofId> {
+        self.interned.get(proof).copied()
+    }
+
+    /// Store a record as supplied, reusing an identifier for an equal record.
+    /// Children must refer to this store. This does not check inference semantics
+    /// or costs; use `check_proof` to validate externally constructed evidence.
+    pub fn insert(&mut self, proof: Proof) -> ProofId {
+        if let Some(id) = self.find(&proof) {
+            return id;
+        }
+        let id = ProofId(self.nodes.len());
+        self.nodes.push(proof.clone());
+        self.interned.insert(proof, id);
+        id
+    }
+
+    /// Build an inference candidate, counting each child occurrence in its cost.
     pub(crate) fn inference(
-        input: Type,
-        output: Type,
+        &self,
+        input: TypeId,
+        output: TypeId,
         rule: Rule,
-        children: Vec<Arc<Self>>,
-    ) -> Arc<Self> {
+        children: Vec<ProofId>,
+    ) -> Proof {
         let mut cost = Cost {
             functions: 0,
             rules: 1,
         };
-        for child in &children {
-            cost.functions += child.cost.functions;
-            cost.rules += child.cost.rules;
+        for &child in &children {
+            cost.functions += self[child].cost.functions;
+            cost.rules += self[child].cost.rules;
         }
-        Arc::new(Self {
+        Proof {
             input,
             output,
             cost,
             node: ProofNode::Inference { rule, children },
-        })
+        }
     }
-    /// Includes endpoints and primitive source locations, so overloaded names
-    /// and different typed rule instances cannot collapse into one alternative.
-    pub fn expression(&self) -> String {
-        match &self.node {
+
+    /// Format a well-formed witness, including typed endpoints and source locations.
+    /// Shared premises appear at every occurrence in the unfolded expression.
+    pub fn expression(&self, id: ProofId, types: &TypeStore) -> String {
+        let proof = &self[id];
+        match &proof.node {
             ProofNode::Primitive {
                 name,
                 line,
@@ -168,63 +205,135 @@ impl Proof {
                         "<{}>",
                         substitutions
                             .iter()
-                            .map(|(n, t)| format!("{n}={t}"))
+                            .map(|(n, t)| format!("{n}={}", types.display(*t)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
                 };
-                format!("{name}{args}@{line}[{} -> {}]", self.input, self.output)
+                format!(
+                    "{name}{args}@{line}[{} -> {}]",
+                    types.display(proof.input),
+                    types.display(proof.output)
+                )
             }
             ProofNode::Inference { rule, children } => {
                 let args = children
                     .iter()
-                    .map(|p| p.expression())
+                    .map(|p| self.expression(*p, types))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{rule}[{} -> {}]({args})", self.input, self.output)
+                format!(
+                    "{rule}[{} -> {}]({args})",
+                    types.display(proof.input),
+                    types.display(proof.output)
+                )
             }
+        }
+    }
+
+    /// Keep reported roots and their reachable premises, rebuilding dense indices.
+    /// Search-created nodes are topological: all children precede their parents.
+    pub(crate) fn retain_roots(&mut self, roots: &mut [ProofId]) {
+        if roots.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        let mut marked = vec![false; self.nodes.len()];
+        let mut pending = roots.to_vec();
+        while let Some(id) = pending.pop() {
+            if marked[id.0] {
+                continue;
+            }
+            marked[id.0] = true;
+            if let ProofNode::Inference { children, .. } = &self[id].node {
+                pending.extend_from_slice(children);
+            }
+        }
+        let old = std::mem::take(self);
+        let mut mapping = vec![None; old.nodes.len()];
+        // The old lookup is transient search state; the surviving records move directly.
+        drop(old.interned);
+        for (index, mut proof) in old.nodes.into_iter().enumerate() {
+            if !marked[index] {
+                continue;
+            }
+            if let ProofNode::Inference { children, .. } = &mut proof.node {
+                for child in children {
+                    *child = mapping[child.0].expect("search stores children before parents");
+                }
+            }
+            mapping[index] = Some(self.insert(proof));
+        }
+        for root in roots {
+            *root = mapping[root.0].expect("reported root is marked");
         }
     }
 }
 
-pub(crate) fn collection_target_allowed(source: &Type, target: &Type, a: &Type, b: &Type) -> bool {
-    if !matches!(target, Type::Named(_, _)) {
-        return true;
+impl Index<ProofId> for ProofStore {
+    type Output = Proof;
+    fn index(&self, id: ProofId) -> &Proof {
+        &self.nodes[id.0]
     }
-    matches!(source, Type::Named(_, _)) && (a != b || source == target)
 }
 
-pub(crate) fn seed_valid(
-    rule: Rule,
-    a: &Type,
-    b: &Type,
-    types: &BTreeMap<String, TypeInfo>,
+impl Proof {
+    pub(crate) fn primitive(id: usize, p: &Primitive) -> Self {
+        Self {
+            input: p.input,
+            output: p.output,
+            cost: Cost {
+                functions: 1,
+                rules: 0,
+            },
+            node: ProofNode::Primitive {
+                id,
+                name: p.name.clone(),
+                line: p.line,
+                description: p.description.clone(),
+                substitutions: p.substitutions.clone(),
+            },
+        }
+    }
+}
+
+pub(crate) fn collection_target_allowed(
+    source: TypeId,
+    target: TypeId,
+    a: TypeId,
+    b: TypeId,
+    types: &TypeStore,
 ) -> bool {
-    let sa = model::explicit_shape(a, types);
-    let sb = model::explicit_shape(b, types);
+    if !matches!(types[target], Type::Named(..)) {
+        return true;
+    }
+    matches!(types[source], Type::Named(..)) && (a != b || source == target)
+}
+
+pub(crate) fn seed_valid(rule: Rule, a: TypeId, b: TypeId, types: &TypeStore) -> bool {
+    let sa = types.shape(a);
+    let sb = types.shape(b);
     match rule {
         Rule::Identity => a == b,
-        Rule::View => matches!(a, Type::Named(_, _)) && a != &sa && b == &sa,
-        Rule::Project(i) => matches!(&sa,Type::Product(v) if v.get(i) == Some(b)),
+        Rule::View => matches!(types[a], Type::Named(..)) && a != sa && b == sa,
+        Rule::Project(i) => matches!(&types[sa], Type::Product(v) if v.get(i) == Some(&b)),
         Rule::NarrowList | Rule::NarrowSet | Rule::NarrowKeys => {
-            let pair = match (rule, &sa, &sb) {
+            let pair = match (rule, &types[sa], &types[sb]) {
                 (Rule::NarrowList, Type::List(s), Type::List(t))
-                | (Rule::NarrowSet, Type::Set(s), Type::Set(t)) => Some((&**s, &**t)),
-                (Rule::NarrowKeys, Type::Map(s, v), Type::Map(t, w)) if v == w => {
-                    Some((&**s, &**t))
-                }
+                | (Rule::NarrowSet, Type::Set(s), Type::Set(t)) => Some((*s, *t)),
+                (Rule::NarrowKeys, Type::Map(s, v), Type::Map(t, w)) if v == w => Some((*s, *t)),
                 _ => None,
             };
             let Some((s, t)) = pair else {
                 return false;
             };
-            let from = model::source_variants(s, types);
-            let to = model::source_variants(t, types);
+            let from = types.source_variants(s);
+            let to = types.source_variants(t);
             // A nominal result must actually filter alternatives, not rebrand
             // an unchanged shape (even if its element has a different name).
             to.is_subset(&from)
-                && collection_target_allowed(a, b, &sa, &sb)
-                && (!matches!(b, Type::Named(_, _)) || a == b || to.len() < from.len())
+                && collection_target_allowed(a, b, sa, sb, types)
+                && (!matches!(types[b], Type::Named(..)) || a == b || to.len() < from.len())
         }
         _ => false,
     }
@@ -232,58 +341,71 @@ pub(crate) fn seed_valid(
 
 pub(crate) fn unary_valid(
     rule: Rule,
-    a: &Type,
-    b: &Type,
+    a: TypeId,
+    b: TypeId,
     child: &Proof,
-    types: &BTreeMap<String, TypeInfo>,
+    types: &TypeStore,
 ) -> bool {
     match rule {
-        Rule::RestrictInput => b == &child.output && model::accepts(&child.input, a),
+        Rule::RestrictInput => b == child.output && types.accepts(child.input, a),
         Rule::ExtendSum => {
-            let supplied = model::source_variants(a, types);
-            let handled = model::handled_variants(&child.input);
-            handled.is_subset(&supplied)
-                && b == &model::union_type(
-                    std::iter::once(child.output.clone())
-                        .chain(supplied.difference(&handled).cloned())
-                        .collect(),
-                )
+            let supplied = types.source_variants(a);
+            let handled = types.handled_variants(child.input);
+            let expected = types
+                .handled_variants(child.output)
+                .into_iter()
+                .chain(supplied.difference(&handled).copied())
+                .collect::<BTreeSet<_>>();
+            handled.is_subset(&supplied) && types.handled_variants(b) == expected
         }
         Rule::MapList | Rule::MapSet | Rule::MapValues | Rule::FlatMap => {
-            let sa = model::explicit_shape(a, types);
-            let sb = model::explicit_shape(b, types);
-            let matches = match (rule, &sa, &sb) {
+            let sa = types.shape(a);
+            let sb = types.shape(b);
+            let matches = match (rule, &types[sa], &types[sb]) {
                 (Rule::MapList, Type::List(s), Type::List(t))
                 | (Rule::MapSet, Type::Set(s), Type::Set(t)) => {
-                    **s == child.input && **t == child.output
+                    *s == child.input && *t == child.output
                 }
                 (Rule::MapValues, Type::Map(k, s), Type::Map(l, t)) => {
-                    k == l && **s == child.input && **t == child.output
+                    k == l && *s == child.input && *t == child.output
                 }
                 (Rule::FlatMap, Type::List(s), Type::List(t)) => {
-                    **s == child.input && child.output == Type::List(t.clone())
+                    *s == child.input
+                        && matches!(types[child.output], Type::List(item) if item == *t)
                 }
                 _ => false,
             };
-            matches && collection_target_allowed(a, b, &sa, &sb)
+            matches && collection_target_allowed(a, b, sa, sb, types)
         }
         _ => false,
     }
 }
 
 pub(crate) fn check(
-    proof: &Arc<Proof>,
+    root: ProofId,
+    proofs: &ProofStore,
     primitives: &[Primitive],
-    types: &BTreeMap<String, TypeInfo>,
+    types: &TypeStore,
 ) -> Result<(), String> {
     fn visit(
-        p: &Arc<Proof>,
+        id: ProofId,
+        proofs: &ProofStore,
         primitives: &[Primitive],
-        types: &BTreeMap<String, TypeInfo>,
-        visited: &mut BTreeSet<usize>,
+        types: &TypeStore,
+        visiting: &mut BTreeSet<ProofId>,
+        visited: &mut BTreeSet<ProofId>,
     ) -> Result<(), String> {
-        if !visited.insert(Arc::as_ptr(p) as usize) {
+        if visited.contains(&id) {
             return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err("proof contains a cycle".into());
+        }
+        let p = proofs
+            .get(id)
+            .ok_or("proof contains an invalid proof identifier")?;
+        if types.get(p.input).is_none() || types.get(p.output).is_none() {
+            return Err("proof contains an invalid type identifier".into());
         }
         let (valid, cost) = match &p.node {
             ProofNode::Primitive {
@@ -307,45 +429,164 @@ pub(crate) fn check(
                 })
             }
             ProofNode::Inference { rule, children } => {
-                for child in children {
-                    visit(child, primitives, types, visited)?;
+                for &child in children {
+                    visit(child, proofs, primitives, types, visiting, visited)?;
                 }
                 let valid = match children.as_slice() {
-                    [] => seed_valid(*rule, &p.input, &p.output, types),
-                    [c] => unary_valid(*rule, &p.input, &p.output, c, types),
-                    [l, r] => match rule {
-                        Rule::Compose => {
-                            p.input == l.input && l.output == r.input && p.output == r.output
+                    [] => seed_valid(*rule, p.input, p.output, types),
+                    [c] => unary_valid(*rule, p.input, p.output, &proofs[*c], types),
+                    [l, r] => {
+                        let l = &proofs[*l];
+                        let r = &proofs[*r];
+                        match rule {
+                            Rule::Compose => {
+                                p.input == l.input && l.output == r.input && p.output == r.output
+                            }
+                            Rule::Fanout => {
+                                p.input == l.input
+                                    && l.input == r.input
+                                    && matches!(&types[p.output], Type::Product(items) if items.as_slice() == [l.output, r.output])
+                            }
+                            _ => false,
                         }
-                        Rule::Fanout => {
-                            p.input == l.input
-                                && l.input == r.input
-                                && p.output
-                                    == Type::Product(vec![l.output.clone(), r.output.clone()])
-                        }
-                        _ => false,
-                    },
+                    }
                     _ => false,
                 };
-                let cost = children.iter().fold(
+                let cost = children.iter().try_fold(
                     Cost {
                         functions: 0,
                         rules: 1,
                     },
-                    |mut sum, c| {
-                        sum.functions += c.cost.functions;
-                        sum.rules += c.cost.rules;
-                        sum
+                    |sum, c| {
+                        Ok::<_, String>(Cost {
+                            functions: sum
+                                .functions
+                                .checked_add(proofs[*c].cost.functions)
+                                .ok_or("proof cost overflow")?,
+                            rules: sum
+                                .rules
+                                .checked_add(proofs[*c].cost.rules)
+                                .ok_or("proof cost overflow")?,
+                        })
                     },
-                );
+                )?;
                 (valid, cost)
             }
         };
-        if valid && cost == p.cost {
-            Ok(())
-        } else {
-            Err(format!("invalid proof node: {}", p.expression()))
+        if !valid || cost != p.cost {
+            return Err(format!(
+                "invalid proof node: {}",
+                proofs.expression(id, types)
+            ));
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        Ok(())
+    }
+    visit(
+        root,
+        proofs,
+        primitives,
+        types,
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+    )
+}
+
+/// Translate a witness DAG into the verifier's independent type and proof stores.
+/// Memoization preserves shared premises; visiting marks reject malformed cycles.
+pub(crate) fn import(
+    root: ProofId,
+    source_types: &TypeStore,
+    source_proofs: &ProofStore,
+    target_types: &mut TypeStore,
+    target_proofs: &mut ProofStore,
+) -> Result<ProofId, String> {
+    /// Translation state for one external witness and all its reachable premises.
+    struct Importer<'a> {
+        /// Source type graph owning every endpoint and substitution identifier.
+        source_types: &'a TypeStore,
+        /// Source proof graph owning the input witness and its children.
+        source_proofs: &'a ProofStore,
+        /// Independently elaborated target graph used by the verifier.
+        target_types: &'a mut TypeStore,
+        /// Translated proof records, inserted after their children.
+        target_proofs: &'a mut ProofStore,
+        /// Translation of source type identifiers, computed at most once per node.
+        types: HashMap<TypeId, TypeId>,
+        /// Translation of source proof identifiers, preserving DAG sharing.
+        proofs: HashMap<ProofId, ProofId>,
+        /// Nodes currently being translated, used to detect cycles.
+        visiting: BTreeSet<ProofId>,
+    }
+    impl Importer<'_> {
+        fn visit(&mut self, id: ProofId) -> Result<ProofId, String> {
+            if let Some(&local) = self.proofs.get(&id) {
+                return Ok(local);
+            }
+            if !self.visiting.insert(id) {
+                return Err("proof contains a cycle".into());
+            }
+            let p = self
+                .source_proofs
+                .get(id)
+                .ok_or("proof contains an invalid proof identifier")?;
+            let input = self
+                .target_types
+                .import(self.source_types, p.input, &mut self.types)?;
+            let output = self
+                .target_types
+                .import(self.source_types, p.output, &mut self.types)?;
+            let node = match &p.node {
+                ProofNode::Primitive {
+                    id,
+                    name,
+                    line,
+                    description,
+                    substitutions,
+                } => ProofNode::Primitive {
+                    id: *id,
+                    name: name.clone(),
+                    line: *line,
+                    description: description.clone(),
+                    substitutions: substitutions
+                        .iter()
+                        .map(|(n, t)| {
+                            Ok((
+                                n.clone(),
+                                self.target_types
+                                    .import(self.source_types, *t, &mut self.types)?,
+                            ))
+                        })
+                        .collect::<Result<_, String>>()?,
+                },
+                ProofNode::Inference { rule, children } => ProofNode::Inference {
+                    rule: *rule,
+                    children: children
+                        .iter()
+                        .map(|c| self.visit(*c))
+                        .collect::<Result<_, _>>()?,
+                },
+            };
+            let local = self.target_proofs.insert(Proof {
+                input,
+                output,
+                cost: p.cost,
+                node,
+            });
+            self.visiting.remove(&id);
+            self.proofs.insert(id, local);
+            Ok(local)
         }
     }
-    visit(proof, primitives, types, &mut BTreeSet::new())
+    Importer {
+        source_types,
+        source_proofs,
+        target_types,
+        target_proofs,
+        types: HashMap::new(),
+        proofs: HashMap::new(),
+        visiting: BTreeSet::new(),
+    }
+    .visit(root)
 }
