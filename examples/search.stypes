@@ -1,0 +1,15 @@
+DEFINITIONS:
+/// A search query.
+Query
+/// An identifier of a matching document.
+DocId
+/// A ranking score.
+Score
+SearchError
+MatchedDocs = Set<DocId>
+Scores = Set<Score>
+matchDocs: Query -> MatchedDocs | SearchError
+score: DocId -> Score
+
+FEATURES:
+searchScores: Query -> Scores | SearchError

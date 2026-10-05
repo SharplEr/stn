@@ -63,7 +63,9 @@ The following concrete lexical conventions are **proposed** for version 1:
   comma, and parentheses.
 - The two sections occur exactly once, in the order shown above.
 - Top-level declarations have zero indentation. Trait members use a positive,
-  consistent number of spaces. Tabs in indentation are rejected.
+  consistent indentation prefix, using spaces or tabs. Mixing spaces and tabs
+  within a prefix or changing the prefix within a trait is rejected. This
+  convention accepts the tab-indented members in validator.stypes.
 - Each declaration occupies one physical line, except a trait and its members.
   Multiline type expressions are outside this first grammar.
 - Blank lines and ordinary comment-only lines do not affect indentation.
@@ -846,6 +848,35 @@ limit prevents that, report incomplete search instead of underivability.
 
 Adding a type to U makes it searchable; it does not declare a primitive,
 establish inhabitance, or grant nominal construction.
+
+### 9.2.1 Implemented search profiles
+
+The Rust validator provides two explicit universe profiles. They share the same
+semantic type model and inference rules; they differ in which intermediate types
+are admitted. This is an additional search bound, separate from nesting depth.
+
+The default **relevant** profile starts with items 1–3 above and closes existing
+collection contexts and sums under elementary transformations. It admits
+explicit products without enumerating every possible product or collection
+context. Ground shapes of all finite family specializations are included.
+See README.md for the exact construction and configuration.
+
+A proof returned in this profile is a valid language derivation. Its minimum
+cost is certified in the relevant universe only. Exhaustive failure in that
+universe is reported as UNRESOLVABLE_IN_RELEVANT_UNIVERSE; it does not assert
+failure in the larger universe of Section 9.2. Naming an intermediate shape can
+extend the relevant universe.
+
+The **exhaustive** profile (`--exhaustive`) enumerates item 4 as well. Its atoms
+include all declared ground nominal types, explicitly mentioned built-in scalar
+types, fixed existential packages, and `()`. Unmentioned built-ins are excluded.
+It uses the largest explicit tuple arity after trait lowering, with a minimum
+of two. It can certify UNRESOLVABLE_WITHIN_BOUNDS on exhaustion of the relation.
+
+Both profiles have type-count and work budgets. Hitting either reports
+SEARCH_INCOMPLETE, without certifying a minimum or underivability. The Rust
+implementation additionally limits a finite parameter environment to 100000
+specializations; exceeding this guard is EXPANSION_LIMIT, a resource outcome.
 
 ### 9.3 Saturation algorithm
 
