@@ -10,10 +10,16 @@ use std::{
     sync::Arc,
 };
 
+/// Input/output pair of type identifiers interned in the search universe.
 type Pair = (usize, usize);
+/// Unary rule instances indexed by their required child morphism's type pair.
+/// Each entry lists the resulting pair and the rule that produces it.
 type UnaryIndex = BTreeMap<Pair, Vec<(Pair, Rule)>>;
 
+/// Work allowance shared by type generation, rule indexing, and agenda operations.
+/// Exhaustion stops certification and yields an incomplete-search diagnostic.
 struct Budget {
+    /// Number of accounted work units that can still be consumed.
     remaining: usize,
 }
 impl Budget {
@@ -326,12 +332,21 @@ fn exhaustive_universe(
     Ok(known)
 }
 
+/// Pending proof candidates for generalized Dijkstra search over type pairs.
+/// Candidates are ordered by lexicographic cost, then by insertion order for
+/// deterministic ties. Offered costs are tentative until a candidate settles.
 struct Agenda {
+    /// Maximum distinct alternatives offered at the best cost for each pair.
     limit: usize,
+    /// Minimum-cost queue containing costs and stable candidate identifiers.
     heap: BinaryHeap<Reverse<(Cost, usize)>>,
+    /// Shared proof trees awaiting removal from the queue, indexed by identifier.
     pending: BTreeMap<usize, Arc<Proof>>,
+    /// Identifier for the next candidate; also breaks equal-cost queue ties.
     serial: usize,
+    /// Lowest candidate cost offered so far for each input/output type pair.
     best_offered: BTreeMap<Pair, Cost>,
+    /// Expressions already offered at a pair's best cost, used for deduplication.
     seen: BTreeMap<Pair, BTreeSet<String>>,
 }
 impl Agenda {

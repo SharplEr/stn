@@ -9,11 +9,17 @@ pub use model::Type;
 pub use proof::{Cost, Proof, ProofNode, Rule};
 use std::{fmt, sync::Arc};
 
+/// Selects the admitted intermediate types and bounds proof-search resources.
+/// Explicitly declared shapes remain available regardless of the depth bound.
 #[derive(Clone, Debug)]
 pub struct ValidationOptions {
+    /// Maximum nesting depth of synthesized anonymous collections and products.
     pub max_depth: usize,
+    /// Maximum number of distinct equal-minimum-cost proofs retained per pair.
     pub max_proofs: usize,
+    /// Maximum number of types admitted to the search universe.
     pub max_types: usize,
+    /// Work budget shared by universe construction and proof search.
     pub max_steps: usize,
     /// Enumerate the complete constructor universe of doc.md §9.2. This can
     /// require exponentially many types even at depth zero (anonymous sums).
@@ -31,11 +37,21 @@ impl Default for ValidationOptions {
     }
 }
 
+/// A failure before feature search, or rejection of a supplied proof witness.
+/// Resource exhaustion during search is recorded in the feature status instead.
 #[derive(Debug)]
 pub enum ValidationError {
+    /// The document does not follow the concrete notation grammar.
     Parse(syntax::ParseError),
+    /// Declarations, validation options, or a supplied proof are invalid.
     Invalid(String),
-    ExpansionLimit { line: usize, limit: usize },
+    /// A finite parameter environment exceeds the elaboration safety limit.
+    ExpansionLimit {
+        /// One-based line of the declaration whose expansion exceeded the guard.
+        line: usize,
+        /// Maximum number of specializations allowed in one parameter environment.
+        limit: usize,
+    },
 }
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,33 +72,54 @@ impl From<syntax::ParseError> for ValidationError {
     }
 }
 
+/// Outcome for one ground feature goal in the selected finite type universe.
+/// An incomplete search does not establish that the goal is unresolvable.
 #[derive(Clone, Debug)]
 pub enum FeatureStatus {
     /// Minimum cost within the selected finite universe, independently checked.
     Proved {
+        /// Retained distinct witnesses, all with the same minimum cost.
         proofs: Vec<Arc<Proof>>,
     },
+    /// The selected universe was exhausted without a derivation of the goal.
     UnresolvableWithinUniverse {
+        /// Explanation of the missing transformation or incompatible types.
         reason: String,
+        /// A bounded sample of outputs reachable from the feature input.
         reachable: Vec<Type>,
     },
+    /// A resource limit or failed witness check prevensourceted certification.
     SearchIncomplete {
+        /// The condition that prevented the search from completing.
         reason: String,
     },
 }
+/// Signature, source location, and search outcome of one feature specialization.
+/// Parameterized feature declarations produce a separate report for each choice.
 #[derive(Clone, Debug)]
 pub struct FeatureReport {
+    /// Feature name, including concrete parameter substitutions when present.
     pub name: String,
+    /// Logical input available to the proof search.
     pub input: Type,
+    /// Exact semantic output required by the feature.
     pub output: Type,
+    /// One-based line of the original feature declaration.
     pub line: usize,
+    /// Checked witnesses or diagnostics for this ground goal.
     pub status: FeatureStatus,
 }
+/// Validation results and search bounds for an entire specification.
+/// Its display representation is the text report written by the CLI.
 #[derive(Clone, Debug)]
 pub struct ValidationReport {
+    /// Synthesized tuple-width bound inferred from declarations and trait lowering.
     pub max_tuple_arity: usize,
+    /// Source label supplied at construction, normally the input path in the CLI.
     pub source_name: String,
+    /// Universe profile and resource limits used for this validation run.
     pub options: ValidationOptions,
+    /// Reports for all ground goals, in declaration and specialization order.
     pub features: Vec<FeatureReport>,
 }
 impl ValidationReport {
@@ -180,7 +217,10 @@ impl fmt::Display for ValidationReport {
     }
 }
 
+/// Validate a UTF-8 specification and construct its report with the supplied
+/// source label, used to identify the document in rendered diagnostics.
 pub fn validate_source(
+    source_name: impl Into<String>,
     source: &str,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
@@ -225,7 +265,7 @@ pub fn validate_source(
         .collect();
     Ok(ValidationReport {
         max_tuple_arity: tuple_arity,
-        source_name: "input".into(),
+        source_name: source_name.into(),
         options: options.clone(),
         features: reports,
     })

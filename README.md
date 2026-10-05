@@ -8,7 +8,8 @@ configuration are concrete Rust code.
 
 ## Build and run
 
-Rust 1.85 or newer is required. The project has no external dependencies.
+Rust 1.85 or newer is required. The CLI uses `clap` with its derive API to
+declare arguments, validate numeric bounds, and generate help and version output.
 
 ```sh
 cargo build --release
@@ -108,7 +109,7 @@ execute the specified functions.
 use stn_validator::{validate_source, ValidationOptions};
 
 let source = "DEFINITIONS:\nA\nFEATURES:\nsame: A -> A\n";
-let report = validate_source(source, &ValidationOptions::default()).unwrap();
+let report = validate_source("example.stypes", source, &ValidationOptions::default()).unwrap();
 assert!(!report.has_unresolved_features());
 println!("{report}");
 ```
@@ -123,7 +124,7 @@ that it is minimal. `syntax::parse` preserves semantic descriptions in its AST.
 - `src/search.rs`: type-universe construction and an indexed weighted agenda.
 - `src/proof.rs`: typed proof nodes, inference premises and witness checking.
 - `src/lib.rs`: validation API and report formatting.
-- `src/main.rs`: command-line parsing, files and exit codes.
+- `src/main.rs`: declarative `clap` argument schema, files and exit codes.
 
 The agenda implements generalized Dijkstra search over morphism pairs.
 Unary rules and collection lifts are indexed by premise pairs; composition uses

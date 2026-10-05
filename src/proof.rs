@@ -10,25 +10,43 @@ use std::{
 /// Lexicographic simplicity: occurrences of primitives, then inference nodes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Cost {
+    /// Number of user-function occurrences in the unfolded proof tree.
     pub functions: usize,
+    /// Number of inference-rule occurrences in the unfolded proof tree.
     pub rules: usize,
 }
 
+/// Inference operation recorded by a proof node.
+/// Rule premises depend on the node's endpoints and ordered child proofs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Rule {
+    /// Return the logical input with the same semantic type.
     Identity,
+    /// Extract a product component at a zero-based index; displayed as one-based.
     Project(usize),
+    /// Expose a nominal type's direct structural description in one direction.
     View,
+    /// Keep list elements belonging to the target alternatives.
     NarrowList,
+    /// Keep set elements belonging to the target alternatives.
     NarrowSet,
+    /// Keep map entries whose keys belong to the target alternatives.
     NarrowKeys,
+    /// Adapt a morphism to an input accepted by its wider input contract.
     RestrictInput,
+    /// Apply a child morphism to handled sum alternatives and preserve the rest.
     ExtendSum,
+    /// Apply an element morphism throughout a list.
     MapList,
+    /// Apply an element morphism to the image of a set.
     MapSet,
+    /// Transform map values while retaining their keys.
     MapValues,
+    /// Apply a list-returning element morphism and concatenate its results.
     FlatMap,
+    /// Run the left child followed by the right child through a matching type.
     Compose,
+    /// Obtain both child results from one logical input as an ordered binary product.
     Fanout,
 }
 impl fmt::Display for Rule {
@@ -53,26 +71,45 @@ impl fmt::Display for Rule {
     }
 }
 
+/// Evidence for a single step: a source morphism or an inference application.
+/// Inference children are ordered and shared with `Arc`; checking verifies their
+/// number, endpoint types, and rule-specific premises.
 #[derive(Clone, Debug)]
 pub enum ProofNode {
+    /// One ground specialization of a morphism declared in `DEFINITIONS`.
     Primitive {
+        /// Index in the specification's expanded primitive signature vector.
         id: usize,
+        /// Original qualified name of the source morphism.
         name: String,
+        /// One-based declaration line used to identify the source contract.
         line: usize,
+        /// Preserved semantic description of the source morphism.
         description: String,
+        /// Concrete choices for its finite declaration and trait parameters.
         substitutions: BTreeMap<String, Type>,
     },
+    /// A structural step justified by zero, one, or two child proofs.
     Inference {
+        /// Inference operation whose premises the checker must validate.
         rule: Rule,
+        /// Ordered premises; composition uses execution order and fanout uses tuple order.
         children: Vec<Arc<Proof>>,
     },
 }
 
+/// Typed witness of a morphism from `input` to `output`, with its simplicity cost.
+/// Storage can form a shared DAG, but cost counts the unfolded tree's occurrences.
+/// Construction by search is followed by an independent semantic witness check.
 #[derive(Clone, Debug)]
 pub struct Proof {
+    /// Exact semantic input accepted by this proof node.
     pub input: Type,
+    /// Exact semantic output established by this proof node.
     pub output: Type,
+    /// Lexicographic cost including the node and all child occurrences.
     pub cost: Cost,
+    /// Primitive reference or inference step justifying the endpoints.
     pub node: ProofNode,
 }
 impl Proof {

@@ -3,16 +3,28 @@ use crate::{ValidationError, syntax};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+/// Semantic type model used after name resolution and finite specialization.
+/// Elaboration normalizes anonymous sums, preserves nominal identity, and gives
+/// existential binders canonical names so bound-variable renaming compares equal.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Type {
+    /// The empty product `()`, distinct from the built-in absence marker `None`.
     Unit,
+    /// A nominal type or ground family application, identified by name and arguments.
     Named(String, Vec<Ty>),
+    /// An anonymous finite sequence whose order and repetitions are significant.
     List(Box<Ty>),
+    /// An anonymous finite set of values of the element type.
     Set(Box<Ty>),
+    /// An anonymous finite partial mapping with separate key and value types.
     Map(Box<Ty>, Box<Ty>),
+    /// An ordered, possibly nested product; components are never implicitly flattened.
     Product(Vec<Ty>),
+    /// Anonymous alternatives, flattened, sorted, and deduplicated by elaboration.
     Sum(Vec<Ty>),
+    /// An existential package: canonical binder name, finite domain, and body type.
     Exists(String, Box<Ty>, Box<Ty>),
+    /// A bound existential variable and its allowed witnesses; not a ground search type.
     Var(String, Vec<Ty>),
 }
 
@@ -63,26 +75,46 @@ impl fmt::Display for Type {
     }
 }
 
+/// Registered declaration of a nominal type or trait receiver before specialization.
+/// The structural description grants a directed view, never type equality or a
+/// reverse constructor. Opaque types and trait receivers have no description.
 #[derive(Clone, Debug)]
 pub(crate) struct TypeInfo {
+    /// Finite parameters of the nominal family, in declaration order.
     pub(crate) parameters: Vec<syntax::Binder>,
+    /// Unresolved right-hand side of a nominal definition, if one was declared.
     pub(crate) body: Option<syntax::TypeExpr>,
 }
 
+/// One ground callable signature with its source contract and substitutions.
+/// Trait members become signatures with a receiver input. The same record shape
+/// represents feature goals, which are kept separate from available morphisms.
 #[derive(Clone, Debug)]
 pub(crate) struct Primitive {
+    /// Original qualified function or feature name, shared by its specializations.
     pub(crate) name: String,
+    /// Resolved input type, including any receiver introduced by trait lowering.
     pub(crate) input: Ty,
+    /// Resolved output type with every declared alternative preserved.
     pub(crate) output: Ty,
+    /// One-based declaration line used in diagnostics and proof references.
     pub(crate) line: usize,
+    /// Semantic prose attached to the source declaration.
     pub(crate) description: String,
+    /// Concrete choices for declaration and enclosing trait parameters.
     pub(crate) substitutions: BTreeMap<String, Ty>,
 }
 
+/// Checked declarations ready for proof search, after finite expansion and
+/// trait lowering. Feature signatures remain goals and never seed the relation.
 pub(crate) struct Specification {
+    /// Default synthesized tuple-width bound inferred from all explicit shapes.
     pub(crate) tuple_arity: usize,
+    /// Nominal declarations indexed by their unique names.
     pub(crate) types: BTreeMap<String, TypeInfo>,
+    /// Ground morphisms provided exclusively by `DEFINITIONS`.
     pub(crate) primitives: Vec<Primitive>,
+    /// Ground goals obtained by expanding declarations in `FEATURES`.
     pub(crate) features: Vec<Primitive>,
 }
 

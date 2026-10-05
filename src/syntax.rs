@@ -1,79 +1,136 @@
 use std::fmt;
 
+/// Parsed specification before name resolution, normalization, or specialization.
+/// Semantic descriptions and declaration lines are retained for later diagnostics.
 #[derive(Clone, Debug)]
 pub struct Document {
+    /// Opaque and structurally defined types from `DEFINITIONS`.
     pub types: Vec<TypeDecl>,
+    /// Standalone function declarations, including qualified static methods.
     pub functions: Vec<FunctionDecl>,
+    /// Trait declarations whose members will become receiver-taking functions.
     pub traits: Vec<TraitDecl>,
+    /// Goals from `FEATURES`; these are not available function declarations.
     pub features: Vec<FeatureDecl>,
 }
 
+/// Source declaration of an opaque nominal type or a nominal structural definition.
 #[derive(Clone, Debug)]
 pub struct TypeDecl {
+    /// Unqualified nominal type name.
     pub name: String,
+    /// Finite family parameters, in source order.
     pub parameters: Vec<Binder>,
+    /// Right-hand side of `=`, or absence for an opaque declaration.
     pub body: Option<TypeExpr>,
+    /// Attached `///` lines, joined with newlines.
     pub description: String,
+    /// One-based declaration line in the original source.
     pub line: usize,
 }
 
+/// Source signature of a standalone morphism before finite parameter expansion.
+/// A qualified name alone does not introduce an implicit receiver.
 #[derive(Clone, Debug)]
 pub struct FunctionDecl {
+    /// Function name, possibly qualified with dots.
     pub name: String,
+    /// Finite parameters local to this function declaration.
     pub parameters: Vec<Binder>,
+    /// Explicit input expression to the left of `->`.
     pub input: TypeExpr,
+    /// Explicit output expression to the right of `->`.
     pub output: TypeExpr,
+    /// Attached semantic description, preserved without interpreting its prose.
     pub description: String,
+    /// One-based declaration line in the original source.
     pub line: usize,
 }
 
+/// Source trait block declaring a nominal receiver and a set of member signatures.
+/// It describes callable structure without declaring concrete implementations.
 #[derive(Clone, Debug)]
 pub struct TraitDecl {
+    /// Nominal receiver name introduced by the trait.
     pub name: String,
+    /// Finite parameters visible in every member signature.
     pub parameters: Vec<Binder>,
+    /// Members in source order, with field syntax already expanded.
     pub members: Vec<MemberDecl>,
+    /// Semantic description attached to the trait header.
     pub description: String,
+    /// One-based line of the trait header.
     pub line: usize,
 }
 
+/// Parsed trait member before adding its receiver argument.
+/// Field syntax `name: T` is represented as an explicit `() -> T` signature.
 #[derive(Clone, Debug)]
 pub struct MemberDecl {
+    /// Unqualified member name, later prefixed with its trait name.
     pub name: String,
+    /// Finite parameters declared on this member in addition to trait parameters.
     pub parameters: Vec<Binder>,
+    /// Member input excluding the receiver; an empty product for field syntax.
     pub input: TypeExpr,
+    /// Member output expression, including any declared error alternatives.
     pub output: TypeExpr,
+    /// Semantic description attached to this member.
     pub description: String,
+    /// One-based line of the member declaration.
     pub line: usize,
 }
 
+/// Source feature signature to be expanded into ground proof-search goals.
+/// Proving a feature never makes its signature available as a morphism.
 #[derive(Clone, Debug)]
 pub struct FeatureDecl {
+    /// Goal name, unique in the feature namespace.
     pub name: String,
+    /// Finite parameters whose choices each require a separate proof.
     pub parameters: Vec<Binder>,
+    /// Input available to the requested computation.
     pub input: TypeExpr,
+    /// Exact output required by the goal.
     pub output: TypeExpr,
+    /// Semantic description of the feature's intended behavior.
     pub description: String,
+    /// One-based declaration line in the original source.
     pub line: usize,
 }
 
+/// A `name from domain` binder used by finite parameters and existential types.
+/// Elaboration resolves the domain and checks that it supplies permitted choices.
 #[derive(Clone, Debug)]
 pub struct Binder {
+    /// Parameter name scoped over the declaration or existential body.
     pub name: String,
+    /// Source expression describing the finite choice domain.
     pub domain: TypeExpr,
 }
 
+/// Type-expression syntax before semantic names and parameter bindings are resolved.
+/// Unlike the semantic type model, sums retain their source order and duplicates.
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
+    /// A type reference and its optional family or collection arguments.
     Name(String, Vec<TypeExpr>),
+    /// Alternatives separated by `|`, to be normalized during elaboration.
     Sum(Vec<TypeExpr>),
+    /// Ordered tuple components; an empty vector represents `()`.
     Product(Vec<TypeExpr>),
+    /// An existential binder and the body over which its name is scoped.
     Exists(Box<Binder>, Box<TypeExpr>),
 }
 
+/// Lexer or parser diagnostic with a one-based source position.
 #[derive(Debug)]
 pub struct ParseError {
+    /// Physical source line containing the error.
     pub line: usize,
+    /// Character column within the source line, counting a tab as one character.
     pub column: usize,
+    /// Explanation of the unexpected input or missing grammar element.
     pub message: String,
 }
 
@@ -138,6 +195,8 @@ impl fmt::Display for TypeExpr {
     }
 }
 
+/// Token categories for declaration and type-expression parsing.
+/// Keywords are lexed as identifiers and interpreted or rejected by the parser.
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     Ident(String),
@@ -153,17 +212,27 @@ enum TokenKind {
     RParen,
 }
 
+/// One token and its character position within the text passed to the lexer.
+/// Member diagnostics add the removed indentation to recover source columns.
 #[derive(Clone, Debug)]
 struct Token {
+    /// Identifier text or punctuation category.
     kind: TokenKind,
+    /// One-based character column in the lexed line text.
     column: usize,
 }
 
+/// Preprocessed physical line used by the indentation-aware document parser.
+/// Ordinary comments are removed, while semantic description text is retained.
 #[derive(Clone, Debug)]
 struct SourceLine {
+    /// One-based physical line number before preprocessing.
     number: usize,
+    /// Exact leading spaces or tabs, compared within a trait block.
     indent: String,
+    /// Declaration text or semantic description without its leading `///`.
     text: String,
+    /// Whether this line contributes to an attached semantic description.
     is_doc: bool,
 }
 
@@ -390,8 +459,11 @@ fn is_trait_header(line: &str, line_no: usize) -> Result<bool, ParseError> {
     ))
 }
 
+/// Parsed trait header before collecting its indented members.
 struct Header {
+    /// Nominal receiver name introduced by the header.
     name: String,
+    /// Finite trait parameters shared by all members.
     parameters: Vec<Binder>,
 }
 
@@ -405,6 +477,8 @@ fn parse_header(line: &str, line_no: usize) -> Result<Header, ParseError> {
     Ok(Header { name, parameters })
 }
 
+/// Result of parsing a non-trait declaration in `DEFINITIONS`.
+/// The syntax after its name distinguishes a type from a function signature.
 enum Definition {
     Type(TypeDecl),
     Function(FunctionDecl),
@@ -595,9 +669,14 @@ fn parse_type_until_end(tokens: &[Token], line: usize) -> Result<TypeExpr, Parse
     Ok(ty)
 }
 
+/// Recursive descent state for one bounded slice of type-expression tokens.
+/// The surrounding declaration parser selects the slice at signature delimiters.
 struct TypeParser<'a> {
+    /// Borrowed tokens belonging to the expression being parsed.
     tokens: &'a [Token],
+    /// Index of the next token to consume.
     cursor: usize,
+    /// Original physical line used by type-expression diagnostics.
     line: usize,
 }
 

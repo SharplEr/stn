@@ -1,33 +1,68 @@
-use std::{ffi::OsString, io::Write, path::PathBuf, process::ExitCode};
+use clap::{Parser, builder::RangedU64ValueParser};
+use std::{io::Write, path::PathBuf, process::ExitCode};
 use stn_validator::{ValidationError, ValidationOptions, validate_source};
 
+/// Declarative command-line schema parsed by clap before any files are opened.
+/// Field attributes define flags, defaults, and admissible numeric values.
+#[derive(Parser)]
+#[command(
+    name = "stn-validator",
+    version,
+    about = "Semantic Types Notation validator",
+    after_help = "Default search uses the relevant universe; see README.md for its scope.\nExit codes: 0 proved, 1 I/O error, 2 invalid input, 3 unresolved, 4 resource limit."
+)]
 struct Args {
+    /// Path of the specification to read as UTF-8
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
+    /// Write the report to a file (default: stdout)
+    #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
-    options: ValidationOptions,
+    /// Maximum nesting depth of synthesized collections and products
+    #[arg(long, value_name = "N", default_value_t = ValidationOptions::default().max_depth)]
+    max_depth: usize,
+    /// Maximum equal-minimum-cost proofs per feature
+    #[arg(
+        long, value_name = "N",
+        default_value_t = ValidationOptions::default().max_proofs,
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    max_proofs: usize,
+    /// Type universe resource limit
+    #[arg(
+        long, value_name = "N",
+        default_value_t = ValidationOptions::default().max_types,
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    max_types: usize,
+    /// Work budget for universe construction and proof search
+    #[arg(
+        long, value_name = "N",
+        default_value_t = ValidationOptions::default().max_steps,
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    max_steps: usize,
+    /// Enumerate the complete bounded constructor universe
+    #[arg(long)]
+    exhaustive: bool,
 }
-enum Command {
-    Validate(Args),
-    Help,
-    Version,
+
+impl Args {
+    /// Convert CLI values into the search configuration used by the library.
+    fn validation_options(&self) -> ValidationOptions {
+        ValidationOptions {
+            max_depth: self.max_depth,
+            max_proofs: self.max_proofs,
+            max_types: self.max_types,
+            max_steps: self.max_steps,
+            exhaustive: self.exhaustive,
+        }
+    }
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args(std::env::args_os().skip(1)) {
-        Ok(Command::Help) => {
-            print_help();
-            return ExitCode::SUCCESS;
-        }
-        Ok(Command::Version) => {
-            println!("stn-validator {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        Ok(Command::Validate(args)) => args,
-        Err(message) => {
-            eprintln!("error: {message}\nRun stn-validator --help for usage.");
-            return ExitCode::from(2);
-        }
-    };
+    let args = Args::parse();
+    let options = args.validation_options();
     let source = match std::fs::read_to_string(&args.input) {
         Ok(source) => source,
         Err(error) => {
@@ -35,7 +70,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut report = match validate_source(&source, &args.options) {
+    let report = match validate_source(args.input.display().to_string(), &source, &options) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("{}: {error}", args.input.display());
@@ -45,14 +80,6 @@ fn main() -> ExitCode {
                 2
             });
         }
-    };
-    report.source_name = args.input.display().to_string();
-    let code = if report.has_incomplete_search() {
-        4
-    } else if report.has_unresolved_features() {
-        3
-    } else {
-        0
     };
     let rendered = report.to_string();
     let result = match args.output {
@@ -68,82 +95,12 @@ fn main() -> ExitCode {
         eprintln!("error: {error}");
         return ExitCode::from(1);
     }
-    ExitCode::from(code)
-}
-
-fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
-    let mut input = None;
-    let mut output = None;
-    let mut options = ValidationOptions::default();
-    let mut positional_only = false;
-    while let Some(arg) = args.next() {
-        if positional_only {
-            set_input(&mut input, arg)?;
-            continue;
-        }
-        match arg.to_str() {
-            Some("-h" | "--help") => return Ok(Command::Help),
-            Some("-V" | "--version") => return Ok(Command::Version),
-            Some("--") => positional_only = true,
-            Some("-o" | "--output") => {
-                output = Some(PathBuf::from(
-                    args.next().ok_or("--output requires a path")?,
-                ))
-            }
-            Some("--exhaustive") => options.exhaustive = true,
-            Some(name @ ("--max-depth" | "--max-proofs" | "--max-types" | "--max-steps")) => {
-                let raw = args
-                    .next()
-                    .ok_or_else(|| format!("{name} requires an integer"))?;
-                let number: usize = raw
-                    .to_str()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| format!("invalid {name} value: {}", raw.to_string_lossy()))?;
-                if name != "--max-depth" && number == 0 {
-                    return Err(format!("{name} must be positive"));
-                }
-                match name {
-                    "--max-depth" => options.max_depth = number,
-                    "--max-proofs" => options.max_proofs = number,
-                    "--max-types" => options.max_types = number,
-                    "--max-steps" => options.max_steps = number,
-                    _ => unreachable!(),
-                }
-            }
-            Some(s) if s.starts_with('-') => return Err(format!("unknown option: {s}")),
-            _ => set_input(&mut input, arg)?,
-        }
-    }
-    Ok(Command::Validate(Args {
-        input: input.ok_or("missing input file")?,
-        output,
-        options,
-    }))
-}
-fn set_input(input: &mut Option<PathBuf>, value: OsString) -> Result<(), String> {
-    if input.replace(PathBuf::from(value)).is_some() {
-        Err("only one input file may be specified".into())
+    let code = if report.has_incomplete_search() {
+        4
+    } else if report.has_unresolved_features() {
+        3
     } else {
-        Ok(())
-    }
-}
-fn print_help() {
-    println!(
-        "Semantic Types Notation validator
-
-Usage: stn-validator [OPTIONS] <INPUT>
-
-Options:
-  -o, --output <PATH>  Write the report to a file (default: stdout)
-      --max-depth <N>  Synthesized collection/product nesting [default: 2]
-      --max-proofs <N> Equal minimum-cost alternatives per feature [default: 5]
-      --max-types <N>  Type universe resource limit [default: 20000]
-      --max-steps <N>  Work resource limit [default: 2000000]
-      --exhaustive     Enumerate the complete bounded constructor universe
-  -h, --help           Print help
-  -V, --version        Print version
-
-Default search uses the relevant universe; see README.md for its scope.
-Exit codes: 0 proved, 1 I/O error, 2 invalid input, 3 unresolved, 4 resource limit."
-    );
+        0
+    };
+    ExitCode::from(code)
 }

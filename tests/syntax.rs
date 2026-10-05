@@ -56,6 +56,7 @@ fn semantic_errors_are_caught_in_unused_declarations() {
     ] {
         assert!(
             validate_source(
+                "input",
                 &format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
                 &ValidationOptions::default()
             )

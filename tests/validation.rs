@@ -2,6 +2,7 @@ use stn_validator::{Cost, FeatureStatus, ValidationOptions, ValidationReport, va
 
 fn validate(defs: &str, goals: &str) -> ValidationReport {
     validate_source(
+        "input",
         &format!("DEFINITIONS:\n{defs}\nFEATURES:\n{goals}\n"),
         &ValidationOptions::default(),
     )
@@ -226,6 +227,7 @@ fn overloads_with_intersections_are_rejected_even_for_equal_outputs() {
         "A\nB\nK\nf: (A | B, K) -> A\nf: (A, K) -> A",
     ] {
         let error = validate_source(
+            "input",
             &format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
             &ValidationOptions::default(),
         )
@@ -253,6 +255,7 @@ fn traits_desugar_receiver_and_expand_closed_parameters() {
 #[test]
 fn generic_specialization_overlap_is_detected() {
     let error = validate_source(
+        "input",
         "DEFINITIONS:\nA\nB\nKinds = A | B\nf<T from Kinds>: A -> T\nFEATURES:\n",
         &ValidationOptions::default(),
     )
@@ -283,7 +286,7 @@ fn existentials_are_alpha_equivalent_but_have_no_implicit_pack_or_unpack() {
 #[test]
 fn declared_deep_shapes_are_admitted_even_at_zero_synthesis_depth() {
     let source = "DEFINITIONS:\nA\nB\nf: List<List<A>> -> B\nFEATURES:\ng: List<List<A>> -> B\n";
-    let report = validate_source(source, &ValidationOptions {
+    let report = validate_source("input", source, &ValidationOptions {
         max_depth: 0,
         ..ValidationOptions::default()
     })
@@ -304,6 +307,7 @@ fn empty_sections_are_valid_and_cycles_are_rejected_before_expansion() {
     assert!(validate("", "").features.is_empty());
     for defs in ["A = B\nB = A", "A<T from B>\nB = A<B>"] {
         let error = validate_source(
+            "input",
             &format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
             &ValidationOptions::default(),
         )
@@ -325,7 +329,7 @@ fn resource_exhaustion_never_reports_underivability_or_minimum_cost() {
             ..ValidationOptions::default()
         },
     ] {
-        let report = validate_source(source, &options).unwrap();
+        let report = validate_source("input", source, &options).unwrap();
         assert!(matches!(
             report.features[0].status,
             FeatureStatus::SearchIncomplete { .. }
@@ -336,7 +340,7 @@ fn resource_exhaustion_never_reports_underivability_or_minimum_cost() {
 #[test]
 fn complete_depth_zero_universe_can_certify_failure() {
     let source = "DEFINITIONS:\nA\nB\nFEATURES:\ng: A -> B\n";
-    let report = validate_source(source, &ValidationOptions {
+    let report = validate_source("input", source, &ValidationOptions {
         exhaustive: true,
         max_depth: 0,
         ..ValidationOptions::default()
@@ -353,14 +357,16 @@ fn proof_alternative_limit_is_respected_and_results_are_deterministic() {
         max_proofs: 1,
         ..ValidationOptions::default()
     };
-    let report = validate_source(source, &options).unwrap();
+    let report = validate_source("input", source, &options).unwrap();
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
     assert_eq!(proofs.len(), 1);
     assert_eq!(
         report.to_string(),
-        validate_source(source, &options).unwrap().to_string()
+        validate_source("input", source, &options)
+            .unwrap()
+            .to_string()
     );
 }
 
@@ -369,7 +375,7 @@ fn external_checker_rejects_an_incorrect_cost_and_rule() {
     use std::sync::Arc;
     use stn_validator::{ProofNode, Rule, check_proof};
     let source = "DEFINITIONS:\nA\nB\nf: A -> B\nFEATURES:\ng: A -> B\n";
-    let report = validate_source(source, &ValidationOptions::default()).unwrap();
+    let report = validate_source("input", source, &ValidationOptions::default()).unwrap();
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
@@ -432,6 +438,7 @@ fn wide_sum_narrowing_has_no_silent_twelve_variant_cutoff() {
 #[test]
 fn exhaustive_search_can_synthesize_a_product_and_certify_minimum_cost() {
     let report = validate_source(
+        "input",
         "DEFINITIONS:\nFEATURES:\nf: () -> ((), ())\n",
         &ValidationOptions {
             exhaustive: true,
@@ -456,7 +463,7 @@ fn full_documentation_examples_keep_their_expected_outcomes() {
             continue;
         }
         count += 1;
-        let result = validate_source(source, &ValidationOptions::default());
+        let result = validate_source("input", source, &ValidationOptions::default());
         if source.contains("f<T from Choices>") {
             assert!(result.is_err());
         } else {
