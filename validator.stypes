@@ -1,0 +1,80 @@
+// Описание валидатора Semantic Types Notation
+DEFINITIONS:
+
+/// аргументы командной строки
+Args
+
+/// Максимальная глубина промежуточных структур которые можно создавать при поиске доказательства
+MaxDepth
+
+/// Максимальное число альтернативных доказательств которые можно выдавать для одной фичи
+MaxProofs
+
+ValidatorConfig = (MaxDepth, MaxProofs)
+
+/// Путь к файлу в файловой системе
+InputPath
+
+/// Выходной файл
+OutputPath
+
+/// Конфигурация
+Config = (ValidatorConfig, InputPath, OutputPath)
+
+/// Ошибка конфигурации
+ConfigError
+
+/// парсинг конфигурации
+parseConfig: Args -> Config | ConfigError
+
+/// Ошибка ввода-вывода
+IOError
+
+/// Строка которую будут пытаться интерпретировать как Semantic Types Notation описание.
+StypesString = String
+
+/// Чтение файла.
+readStypesFile: InputPath -> StypesString | IOError
+
+/// Запись из секции DEFINITIONS
+Definition
+
+/// Запись из секции FEATURES
+Feature
+
+
+/// AST для Semantic Types Notation формата
+StypesAst:
+	definitions: Set<Definition>
+	features: Set<Feature>
+
+/// Ошибка парсинга Semantic Types Notation формата
+ParsingError
+
+
+/// Парсит строку в AST и проверяет его корректность, но без доказательств
+parseStypes: StypesString -> StypesAst | ParsingError
+
+/// Доказательство разрешимости
+Proof
+
+/// Ошибка в случае если доказать не удается
+ProofError
+
+
+/// Пытается найти доказательства для фичи
+findProofs: (ValidatorConfig, Set<Definition>, Feature) -> Set<Proof> | ProofError
+
+/// Форматирует все доказательства или ошибки доказательств в выходную строку.
+/// Для стабильности вывода все коллекции должны сохранять порядок при превращении в строки
+formatProofs: Map<Feature, (Set<Proof> | ProofError)> -> OutputString
+
+/// Результаты доказательств
+OutputString = String
+
+/// Запись результатов работы в файл, возможно в терминал
+writeOutput: (OutputString, OutputPath) -> () | IOError
+
+FEATURES:
+
+validate: Args -> OutputString | IOError | ConfigError | ParsingError
