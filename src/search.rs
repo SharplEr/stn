@@ -31,6 +31,8 @@ impl Budget {
     }
 }
 
+/// Admit a new universe member without charging duplicates against the type cap.
+/// The bound applies to admitted search types, not every node interned in the store.
 fn insert_type(
     known: &mut BTreeSet<TypeId>,
     ty: TypeId,
@@ -49,6 +51,9 @@ fn insert_type(
     Ok(true)
 }
 
+/// Collect all ground declarations, callable endpoints, feature goals, and their
+/// subexpressions, repeatedly exposing newly discovered direct nominal bodies.
+/// Explicit shapes bypass the synthesized-depth bound but still obey the type cap.
 fn explicit_types(
     primitives: &[Primitive],
     features: &[Primitive],
@@ -77,6 +82,8 @@ fn explicit_types(
     Ok(out)
 }
 
+/// Seed elementary universe transformations from directed nominal views and product
+/// projections. These pairs guide type generation; they are not proof witnesses.
 fn structural_steps(known: &BTreeSet<TypeId>, types: &TypeStore) -> BTreeSet<(TypeId, TypeId)> {
     let mut steps = BTreeSet::new();
     for &t in known {
@@ -95,6 +102,9 @@ fn structural_steps(known: &BTreeSet<TypeId>, types: &TypeStore) -> BTreeSet<(Ty
 
 /// Admit explicit products and close existing collections and sums under
 /// elementary transformations, rather than enumerating the full depth grammar.
+/// Iterate to a fixed point using user signatures, views, projections, collection
+/// lifts, flattening, narrowing, and carried sum alternatives. Newly synthesized
+/// shapes obey the depth bound; resource exhaustion prevents certification.
 fn relevant_universe(
     explicit: &BTreeSet<TypeId>,
     primitives: &[Primitive],
@@ -206,6 +216,9 @@ fn relevant_universe(
     }
 }
 
+/// Add declared nominal targets matching a changed collection result shape.
+/// Only nominal sources can use this route, and preserving a shape cannot grant
+/// a different nominal identity. This mirrors the proof checker's lift guard.
 fn nominal_steps(
     source: TypeId,
     result_shape: TypeId,
@@ -222,6 +235,9 @@ fn nominal_steps(
     }
 }
 
+/// Enumerate every nonempty subset of the candidate alternatives as a normalized
+/// union. Incremental subset construction avoids fixed-width bit-mask limits;
+/// the work and type caps stop its potentially exponential growth explicitly.
 fn add_sums(
     known: &mut BTreeSet<TypeId>,
     candidates: &[TypeId],
@@ -245,6 +261,10 @@ fn add_sums(
     Ok(())
 }
 
+/// Enumerate the complete constructor universe within the depth and tuple-width
+/// bounds, retaining explicit shapes even when they exceed the synthesis depth.
+/// Start with atoms and their sums, then add collections, ordered products, and
+/// their sums at each depth. Resource caps can interrupt this exhaustive profile.
 fn exhaustive_universe(
     explicit: &BTreeSet<TypeId>,
     types: &mut TypeStore,
@@ -327,6 +347,9 @@ impl Agenda {
             seen: BTreeMap::new(),
         }
     }
+    /// Offer a candidate at its pair's best known cost, resetting alternatives
+    /// when a cheaper cost arrives. Reject worse, duplicate, or excess candidates
+    /// before inserting records; settlement later establishes minimum costs.
     fn offer(
         &mut self,
         pair: Pair,
@@ -372,6 +395,10 @@ impl Agenda {
     }
 }
 
+/// Run bounded search and return feature outcomes with their owned witness graph.
+/// Any interrupted run makes all goals incomplete, so partial candidates cannot
+/// be reported as certified minima. Compact successful roots and their premises
+/// before returning, rewriting every reported identifier to the compacted store.
 pub(crate) fn search(
     primitives: &[Primitive],
     features: &[Primitive],
@@ -379,9 +406,6 @@ pub(crate) fn search(
     options: &ValidationOptions,
     tuple_arity: usize,
 ) -> (ProofStore, Vec<FeatureStatus>) {
-    let mut budget = Budget {
-        remaining: options.max_steps,
-    };
     let mut proofs = ProofStore::default();
     let mut statuses = match run(
         primitives,
@@ -389,7 +413,6 @@ pub(crate) fn search(
         types,
         &mut proofs,
         options,
-        &mut budget,
         tuple_arity,
     ) {
         Ok(statuses) => statuses,
@@ -421,23 +444,31 @@ pub(crate) fn search(
     (proofs, statuses)
 }
 
+/// Solve all goals over the chosen finite type universe using generalized Dijkstra.
+/// Index unary rules, restrictions, sum extensions, and admitted fanout products;
+/// combine settled pairs through incoming/outgoing composition indexes. Positive
+/// inference costs permit stopping after all minimum goal alternatives settle.
+/// Independently check returned witnesses; exhausted goals get diagnostics about
+/// this universe, while resource or witness-check failures propagate to `search`.
 fn run(
     primitives: &[Primitive],
     features: &[Primitive],
     types: &mut TypeStore,
     proofs: &mut ProofStore,
     options: &ValidationOptions,
-    budget: &mut Budget,
     tuple_arity: usize,
 ) -> Result<Vec<FeatureStatus>, String> {
     if features.is_empty() {
         return Ok(Vec::new());
     }
+    let mut budget = Budget {
+        remaining: options.max_steps,
+    };
     let explicit = explicit_types(primitives, features, types, options)?;
     let known = if options.exhaustive {
-        exhaustive_universe(&explicit, types, options, budget, tuple_arity)?
+        exhaustive_universe(&explicit, types, options, &mut budget, tuple_arity)?
     } else {
-        relevant_universe(&explicit, primitives, types, options, budget)?
+        relevant_universe(&explicit, primitives, types, options, &mut budget)?
     };
     let mut universe = known.into_iter().collect::<Vec<_>>();
     universe.sort_unstable_by(|a, b| types.compare(*a, *b));
@@ -457,7 +488,7 @@ fn run(
             (i, i),
             proofs.inference(a, a, Rule::Identity, vec![]),
             proofs,
-            budget,
+            &mut budget,
         )?;
         if shapes[i] != a {
             if let Some(&j) = ids.get(&shapes[i]) {
@@ -465,7 +496,7 @@ fn run(
                     (i, j),
                     proofs.inference(a, shapes[i], Rule::View, vec![]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -476,7 +507,7 @@ fn run(
                     (i, j),
                     proofs.inference(a, *t, Rule::Project(k), vec![]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -499,7 +530,12 @@ fn run(
             }
             for rule in [Rule::NarrowList, Rule::NarrowSet, Rule::NarrowKeys] {
                 if i != j && proof::seed_valid(rule, a, b, types) {
-                    agenda.offer((i, j), proofs.inference(a, b, rule, vec![]), proofs, budget)?;
+                    agenda.offer(
+                        (i, j),
+                        proofs.inference(a, b, rule, vec![]),
+                        proofs,
+                        &mut budget,
+                    )?;
                 }
             }
             if !proof::collection_target_allowed(a, b, shapes[i], shapes[j], types) {
@@ -531,7 +567,7 @@ fn run(
             (ids[&p.input], ids[&p.output]),
             Proof::primitive(id, p),
             proofs,
-            budget,
+            &mut budget,
         )?;
     }
     let goals = features
@@ -577,7 +613,7 @@ fn run(
                     (s, t),
                     proofs.inference(universe[s], universe[t], rule, vec![p]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -586,7 +622,7 @@ fn run(
                 (s, b),
                 proofs.inference(universe[s], output, Rule::RestrictInput, vec![p]),
                 proofs,
-                budget,
+                &mut budget,
             )?;
         }
         for &s in &sums[a] {
@@ -602,7 +638,7 @@ fn run(
                     (s, t),
                     proofs.inference(universe[s], result, Rule::ExtendSum, vec![p]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -612,7 +648,7 @@ fn run(
                     (a, c),
                     proofs.inference(input, proofs[q].output, Rule::Compose, vec![p, q]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -622,7 +658,7 @@ fn run(
                     (x, b),
                     proofs.inference(proofs[q].input, output, Rule::Compose, vec![q, p]),
                     proofs,
-                    budget,
+                    &mut budget,
                 )?;
             }
         }
@@ -633,7 +669,7 @@ fn run(
                         (a, t),
                         proofs.inference(input, universe[t], Rule::Fanout, vec![p, q]),
                         proofs,
-                        budget,
+                        &mut budget,
                     )?;
                 }
                 if let Some(&t) = fanouts.get(&(c, b)) {
@@ -641,7 +677,7 @@ fn run(
                         (a, t),
                         proofs.inference(input, universe[t], Rule::Fanout, vec![q, p]),
                         proofs,
-                        budget,
+                        &mut budget,
                     )?;
                 }
             }
@@ -669,6 +705,10 @@ fn run(
     Ok(statuses)
 }
 
+/// Explain common missing steps using the bounded sample of reachable outputs:
+/// nominal construction, scalar error handling, or flat-product construction.
+/// This diagnostic supplements the exhausted relation; it is not a separate
+/// derivability test and cannot establish failure outside the selected universe.
 fn failure_reason(target: TypeId, reachable: &[TypeId], types: &TypeStore) -> String {
     let target_text = types.display(target);
     if matches!(types[target], Type::Named(..))

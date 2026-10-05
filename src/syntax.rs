@@ -152,6 +152,8 @@ impl ParseError {
 }
 
 impl fmt::Display for TypeExpr {
+    /// Render parsed type syntax with product parentheses and grouped existential
+    /// sum alternatives, so the printed expression preserves binder scope.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Name(name, args) if args.is_empty() => f.write_str(name),
@@ -236,6 +238,10 @@ struct SourceLine {
     is_doc: bool,
 }
 
+/// Parse the ordered `DEFINITIONS` and `FEATURES` sections into a source AST.
+/// Attach `///` descriptions to declarations, collect consistently indented trait
+/// blocks, and reject misplaced sections, indentation, or unattached descriptions.
+/// Name resolution and finite-domain validation are deferred to elaboration.
 pub fn parse(source: &str) -> Result<Document, ParseError> {
     let lines = source_lines(source)?;
     let mut section = 0_u8;
@@ -388,6 +394,9 @@ pub fn parse(source: &str) -> Result<Document, ParseError> {
     Ok(document)
 }
 
+/// Separate indentation and semantic descriptions from physical source lines,
+/// stripping ordinary comments while preserving line numbers and empty doc lines.
+/// Significant lines may use spaces or tabs for indentation, but cannot mix them.
 fn source_lines(source: &str) -> Result<Vec<SourceLine>, ParseError> {
     let mut result = Vec::new();
     for (index, raw) in source.lines().enumerate() {
@@ -467,6 +476,8 @@ struct Header {
     parameters: Vec<Binder>,
 }
 
+/// Parse a trait's unqualified name and optional finite binders, requiring a final
+/// colon and no member signature or other trailing tokens on the header line.
 fn parse_header(line: &str, line_no: usize) -> Result<Header, ParseError> {
     let tokens = tokenize(line, line_no)?;
     let mut cursor = 0;
@@ -484,6 +495,9 @@ enum Definition {
     Function(FunctionDecl),
 }
 
+/// Distinguish an opaque type, nominal structural definition, and free function
+/// from the tokens following its name and binders. Qualified names are allowed
+/// only for functions; signatures split at an arrow outside nested constructors.
 fn parse_definition(
     line: &str,
     line_no: usize,
@@ -541,6 +555,8 @@ fn parse_definition(
     }))
 }
 
+/// Parse a trait member signature, interpreting a bare output type as the field
+/// shorthand `() -> Output`. Receiver insertion is deferred to trait lowering.
 fn parse_member(line: &str, line_no: usize, description: String) -> Result<MemberDecl, ParseError> {
     let tokens = tokenize(line, line_no)?;
     let mut cursor = 0;
@@ -569,6 +585,8 @@ fn parse_member(line: &str, line_no: usize, description: String) -> Result<Membe
     })
 }
 
+/// Parse a named, optionally parameterized feature goal with an explicit arrow.
+/// The separate AST record lets elaboration retain it as a goal, not a morphism.
 fn parse_feature(
     line: &str,
     line_no: usize,
@@ -593,6 +611,9 @@ fn parse_feature(
     })
 }
 
+/// Parse a declaration's optional `<T from Domain, ...>` list, advancing the
+/// cursor past its closing bracket. Nested type constructors belong to domains;
+/// domain names and admissible witnesses are checked during elaboration.
 fn parse_optional_binders(
     tokens: &[Token],
     cursor: &mut usize,
@@ -618,6 +639,8 @@ fn parse_optional_binders(
     }
 }
 
+/// Locate the comma or closing angle bracket ending one binder's domain, ignoring
+/// delimiters inside nested generic arguments and parenthesized expressions.
 fn find_binder_end(tokens: &[Token], start: usize, line: usize) -> Result<usize, ParseError> {
     let mut depth = 0_i32;
     for (index, token) in tokens.iter().enumerate().skip(start) {
@@ -639,6 +662,8 @@ fn find_binder_end(tokens: &[Token], start: usize, line: usize) -> Result<usize,
     ))
 }
 
+/// Locate a signature arrow outside generic arguments and parenthesized types.
+/// The returned index separates input and output token slices for type parsing.
 fn find_top_level_arrow(tokens: &[Token], start: usize) -> Option<usize> {
     let mut depth = 0_i32;
     for (index, token) in tokens.iter().enumerate().skip(start) {
@@ -652,6 +677,8 @@ fn find_top_level_arrow(tokens: &[Token], start: usize) -> Option<usize> {
     None
 }
 
+/// Parse one complete type expression from a declaration-selected token slice.
+/// Reject leftover tokens so a valid prefix cannot hide malformed trailing syntax.
 fn parse_type_until_end(tokens: &[Token], line: usize) -> Result<TypeExpr, ParseError> {
     let mut parser = TypeParser {
         tokens,
@@ -681,6 +708,8 @@ struct TypeParser<'a> {
 }
 
 impl TypeParser<'_> {
+    /// Parse the lowest-precedence `|` chain. Keep its source structure in the AST;
+    /// flattening, commutativity, and duplicate elimination belong to elaboration.
     fn parse_sum(&mut self) -> Result<TypeExpr, ParseError> {
         let mut items = vec![self.parse_primary()?];
         while self.consume(TokenKind::Pipe) {
@@ -693,6 +722,9 @@ impl TypeParser<'_> {
         }
     }
 
+    /// Parse a named application, parentheses/product, or existential package.
+    /// An existential body consumes a full sum, giving its binder scope over all
+    /// alternatives until the surrounding expression's delimiter.
     fn parse_primary(&mut self) -> Result<TypeExpr, ParseError> {
         if self.peek_ident("exists") {
             self.cursor += 1;
@@ -718,6 +750,8 @@ impl TypeParser<'_> {
         }
     }
 
+    /// Isolate an existential's domain at the first unnested colon, then parse
+    /// that slice as a complete type without consuming the binder/body separator.
     fn parse_sum_until_colon(&mut self) -> Result<TypeExpr, ParseError> {
         let start = self.cursor;
         let mut depth = 0_i32;
@@ -733,6 +767,8 @@ impl TypeParser<'_> {
         parse_type_until_end(&self.tokens[start..self.cursor], self.line)
     }
 
+    /// Distinguish unit `()`, grouping `(T)`, and an ordered product `(T, U, ...)`.
+    /// Components are full sum expressions, and nested products stay nested.
     fn parse_product(&mut self) -> Result<TypeExpr, ParseError> {
         self.cursor += 1;
         if self.consume(TokenKind::RParen) {
@@ -755,6 +791,8 @@ impl TypeParser<'_> {
         Ok(TypeExpr::Product(items))
     }
 
+    /// Parse a type name and optional comma-separated type arguments. Arguments
+    /// can themselves be sums or nested applications; arity is checked later.
     fn parse_named(&mut self) -> Result<TypeExpr, ParseError> {
         let name = self.take_name()?;
         let mut args = Vec::new();
@@ -927,6 +965,9 @@ fn ensure_end(tokens: &[Token], cursor: usize, line: usize) -> Result<(), ParseE
     }
 }
 
+/// Tokenize one comment-free declaration using ASCII identifiers, punctuation,
+/// and the two-character arrow. Retain one-based character columns for syntax
+/// diagnostics and reject every character not admitted by the concrete grammar.
 fn tokenize(text: &str, line: usize) -> Result<Vec<Token>, ParseError> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();

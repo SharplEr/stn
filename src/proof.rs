@@ -1,6 +1,7 @@
 //! Typed proof witnesses and a checker independent of the search agenda.
 use crate::model::Primitive;
 use crate::{Type, TypeId, TypeStore};
+use indexmap::IndexSet;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
@@ -123,10 +124,8 @@ pub struct ProofId(usize);
 /// from reported roots when it transfers this store into the validation report.
 #[derive(Clone, Debug, Default)]
 pub struct ProofStore {
-    /// Canonical proof records, indexed by their identifiers.
-    nodes: Vec<Proof>,
-    /// Lookup keys contain immediate child identifiers, never recursive proofs.
-    interned: HashMap<Proof, ProofId>,
+    /// Canonical records stored once, with hash lookup and stable insertion indices.
+    nodes: IndexSet<Proof>,
 }
 
 impl ProofStore {
@@ -142,28 +141,24 @@ impl ProofStore {
 
     /// Look up a record using an identifier originating from this store.
     pub fn get(&self, id: ProofId) -> Option<&Proof> {
-        self.nodes.get(id.0)
+        self.nodes.get_index(id.0)
     }
 
     /// Find an existing record; child identifiers must belong to this store.
     pub fn find(&self, proof: &Proof) -> Option<ProofId> {
-        self.interned.get(proof).copied()
+        self.nodes.get_index_of(proof).map(ProofId)
     }
 
     /// Store a record as supplied, reusing an identifier for an equal record.
     /// Children must refer to this store. This does not check inference semantics
     /// or costs; use `check_proof` to validate externally constructed evidence.
     pub fn insert(&mut self, proof: Proof) -> ProofId {
-        if let Some(id) = self.find(&proof) {
-            return id;
-        }
-        let id = ProofId(self.nodes.len());
-        self.nodes.push(proof.clone());
-        self.interned.insert(proof, id);
-        id
+        ProofId(self.nodes.insert_full(proof).0)
     }
 
     /// Build an inference candidate, counting each child occurrence in its cost.
+    /// Children must already exist in this store. The candidate is not inserted
+    /// here; the agenda first checks its cost and the alternative limit.
     pub(crate) fn inference(
         &self,
         input: TypeId,
@@ -233,6 +228,8 @@ impl ProofStore {
 
     /// Keep reported roots and their reachable premises, rebuilding dense indices.
     /// Search-created nodes are topological: all children precede their parents.
+    /// Both root identifiers and child references are remapped; all other search
+    /// candidates are discarded. Shared premises remain single stored records.
     pub(crate) fn retain_roots(&mut self, roots: &mut [ProofId]) {
         if roots.is_empty() {
             *self = Self::default();
@@ -251,8 +248,7 @@ impl ProofStore {
         }
         let old = std::mem::take(self);
         let mut mapping = vec![None; old.nodes.len()];
-        // The old lookup is transient search state; the surviving records move directly.
-        drop(old.interned);
+        // Move surviving records in insertion order, remapping children before parents.
         for (index, mut proof) in old.nodes.into_iter().enumerate() {
             if !marked[index] {
                 continue;
@@ -278,6 +274,8 @@ impl Index<ProofId> for ProofStore {
 }
 
 impl Proof {
+    /// Record one expanded user morphism with cost `(1, 0)` and the source
+    /// metadata that the independent checker compares against its declaration.
     pub(crate) fn primitive(id: usize, p: &Primitive) -> Self {
         Self {
             input: p.input,
@@ -297,6 +295,10 @@ impl Proof {
     }
 }
 
+/// Guard collection lifts against implicit nominal construction.
+/// An anonymous source cannot acquire a nominal result. A nominal source may
+/// produce another nominal collection when the operation changes its shape;
+/// preserving a shape only permits preserving the original nominal identity.
 pub(crate) fn collection_target_allowed(
     source: TypeId,
     target: TypeId,
@@ -310,6 +312,11 @@ pub(crate) fn collection_target_allowed(
     matches!(types[source], Type::Named(..)) && (a != b || source == target)
 }
 
+/// Check an inference rule with no child proofs: identity, a directed nominal
+/// view, a product projection, or collection narrowing. Other rules return false.
+/// Narrowing compares alternative sets while preserving map values. Producing
+/// a different nominal collection must remove alternatives, rather than merely
+/// rename an unchanged shape. All identifiers must belong to `types`.
 pub(crate) fn seed_valid(rule: Rule, a: TypeId, b: TypeId, types: &TypeStore) -> bool {
     let sa = types.shape(a);
     let sb = types.shape(b);
@@ -339,6 +346,11 @@ pub(crate) fn seed_valid(rule: Rule, a: TypeId, b: TypeId, types: &TypeStore) ->
     }
 }
 
+/// Check the type-level premises of a rule with one child: input restriction,
+/// sum extension, a collection lift, or list flattening. Sum extension replaces
+/// exactly the handled alternatives and carries every other alternative through.
+/// This checks the parent endpoints against the child signature; the caller is
+/// responsible for validating the child proof and recomputing the total cost.
 pub(crate) fn unary_valid(
     rule: Rule,
     a: TypeId,
@@ -381,12 +393,18 @@ pub(crate) fn unary_valid(
     }
 }
 
+/// Validate every node reachable from a witness root independently of search.
+/// Check source morphism metadata, rule arity and endpoints, and unfolded-tree
+/// costs. Visiting marks reject cycles; completed marks avoid checking a shared
+/// premise twice. This establishes validity, not minimum cost or search bounds.
 pub(crate) fn check(
     root: ProofId,
     proofs: &ProofStore,
     primitives: &[Primitive],
     types: &TypeStore,
 ) -> Result<(), String> {
+    /// Check children before their parent, distinguishing the active recursion
+    /// path from nodes whose semantics and costs have already been verified.
     fn visit(
         id: ProofId,
         proofs: &ProofStore,
@@ -520,6 +538,8 @@ pub(crate) fn import(
         visiting: BTreeSet<ProofId>,
     }
     impl Importer<'_> {
+        /// Translate children before inserting their parent, memoizing both type
+        /// and proof identifiers. Reject missing source nodes and back edges.
         fn visit(&mut self, id: ProofId) -> Result<ProofId, String> {
             if let Some(&local) = self.proofs.get(&id) {
                 return Ok(local);

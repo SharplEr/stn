@@ -132,6 +132,11 @@ stores. Externally constructed records can be added with `ProofStore::insert`;
 the checker rejects invalid rules, costs, missing children, and cycles.
 `syntax::parse` preserves semantic descriptions in its AST.
 
+Both stores use `indexmap::IndexSet` to combine hash lookup with access by index,
+keeping each node in a single collection. Inserting an equal node reuses its
+index; appending a new node preserves all existing identifiers. Proof compaction
+rebuilds the set and explicitly remaps the surviving roots and child references.
+
 - `src/syntax.rs`: line lexer and recursive descent parser.
 - `src/model.rs`: interned type graph and declaration registry, finite elaboration, trait lowering,
   cycle detection, existential normalization and overload intersection checks.

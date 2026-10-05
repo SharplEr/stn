@@ -139,6 +139,8 @@ impl ValidationReport {
     }
 }
 impl fmt::Display for ValidationReport {
+    /// Render goal signatures, certified proof costs, and profile-specific failure
+    /// statuses using the report's owning stores to resolve all node identifiers.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Semantic Types Notation: {}", self.source_name)?;
         writeln!(
@@ -227,6 +229,9 @@ impl fmt::Display for ValidationReport {
 
 /// Validate a UTF-8 specification and construct its report with the supplied
 /// source label, used to identify the document in rendered diagnostics.
+/// Parse and elaborate declarations before searching each ground feature goal.
+/// Declaration failures return an error; proof-search exhaustion is represented
+/// in feature statuses. The returned report owns both graphs needed by its IDs.
 pub fn validate_source(
     source_name: impl Into<String>,
     source: &str,

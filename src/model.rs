@@ -1,4 +1,5 @@
 use crate::{ValidationError, syntax};
+use indexmap::IndexSet;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -40,10 +41,8 @@ pub enum Type {
 /// resolved nominal bodies are cached as directed structural views.
 #[derive(Clone, Debug, Default)]
 pub struct TypeStore {
-    /// Canonical nodes; child identifiers index this vector.
-    nodes: Vec<Type>,
-    /// Lookup of existing nodes; keys contain identifiers, never recursive trees.
-    interned: HashMap<Type, TypeId>,
+    /// Canonical nodes stored once, with hash lookup and stable insertion indices.
+    nodes: IndexSet<Type>,
     /// Source declarations indexed by their unique nominal names.
     declarations: BTreeMap<String, TypeInfo>,
     /// Resolved bodies of nominal specializations, including predefined `Bytes`.
@@ -63,12 +62,12 @@ impl TypeStore {
 
     /// Look up a node using an identifier originating from this store.
     pub fn get(&self, id: TypeId) -> Option<&Type> {
-        self.nodes.get(id.0)
+        self.nodes.get_index(id.0)
     }
 
     /// Find an already interned, normalized node using children from this store.
     pub fn find(&self, node: &Type) -> Option<TypeId> {
-        self.interned.get(node).copied()
+        self.nodes.get_index_of(node).map(TypeId)
     }
 
     /// Format a semantic type with access to its child nodes.
@@ -76,7 +75,9 @@ impl TypeStore {
         TypeDisplay { store: self, id }
     }
 
-    /// Intern one node; only its immediate children are copied into the lookup key.
+    /// Normalize and intern one node, reusing its existing insertion index.
+    /// Empty products become unit; anonymous sums are flattened, sorted by
+    /// semantic structure, and deduplicated. Nominal nodes retain their identity.
     pub(crate) fn intern(&mut self, node: Type) -> TypeId {
         let node = match node {
             Type::Product(items) if items.is_empty() => Type::Unit,
@@ -97,13 +98,7 @@ impl TypeStore {
             }
             other => other,
         };
-        if let Some(&id) = self.interned.get(&node) {
-            return id;
-        }
-        let id = TypeId(self.nodes.len());
-        self.nodes.push(node.clone());
-        self.interned.insert(node, id);
-        id
+        TypeId(self.nodes.insert_full(node).0)
     }
 
     /// Compare structure for deterministic presentation, independently of allocation order.
@@ -167,10 +162,14 @@ impl TypeStore {
         }
     }
 
+    /// Alternatives available in a supplied value, exposing the direct body of
+    /// a nominal sum. Non-sum types contribute their original nominal identity.
     pub(crate) fn source_variants(&self, id: TypeId) -> BTreeSet<TypeId> {
         self.outer_variants(id).into_iter().collect()
     }
 
+    /// Alternatives explicitly accepted by a morphism's input signature.
+    /// Only anonymous sums are expanded; a nominal input stays a single type.
     pub(crate) fn handled_variants(&self, id: TypeId) -> BTreeSet<TypeId> {
         match &self[id] {
             Type::Sum(items) => items.iter().copied().collect(),
@@ -178,10 +177,15 @@ impl TypeStore {
         }
     }
 
+    /// Construct a normalized anonymous union, flattening nested sums while
+    /// preserving nominal alternatives and reusing any already interned result.
     pub(crate) fn union(&mut self, items: Vec<TypeId>) -> TypeId {
         self.intern(Type::Sum(items))
     }
 
+    /// Measure synthesized collection/product nesting for the search bound.
+    /// Sums take their maximum alternative depth; named types and existential
+    /// packages count as atoms, without expanding their structural descriptions.
     pub(crate) fn depth(&self, id: TypeId) -> usize {
         match &self[id] {
             Type::Unit | Type::Named(..) | Type::Var(..) | Type::Exists(..) => 0,
@@ -192,6 +196,9 @@ impl TypeStore {
         }
     }
 
+    /// Decide whether an input contract accepts a supplied type through anonymous
+    /// sum inclusion or componentwise product matching. Nominal structural views
+    /// and collection covariance are not implicit parts of input compatibility.
     pub(crate) fn accepts(&self, contract: TypeId, supplied: TypeId) -> bool {
         if contract == supplied {
             return true;
@@ -207,6 +214,8 @@ impl TypeStore {
     }
 
     /// Collect ground subexpressions, specializing existential bodies only for enumeration.
+    /// The output set also marks visited nodes. Existential witnesses add concrete
+    /// body types to the universe, without granting package construction or unpacking.
     pub(crate) fn collect(&mut self, id: TypeId, out: &mut BTreeSet<TypeId>) {
         if !out.insert(id) {
             return;
@@ -240,6 +249,8 @@ impl TypeStore {
         }
     }
 
+    /// Find the first occurrence of a canonical bound variable in a type body,
+    /// so enumeration can obtain its finite witnesses without unpacking a value.
     fn find_variable(&self, id: TypeId, name: &str) -> Option<TypeId> {
         match &self[id] {
             Type::Var(n, _) if n == name => Some(id),
@@ -255,6 +266,9 @@ impl TypeStore {
         }
     }
 
+    /// Specialize a type body for one finite existential witness. Rebuild affected
+    /// constructors through interning, normalize resulting sums, and resolve the
+    /// structural views of newly concrete nominal applications.
     fn substitute(&mut self, id: TypeId, name: &str, value: TypeId) -> TypeId {
         let node = match self[id].clone() {
             Type::Var(n, _) if n == name => return value,
@@ -289,6 +303,9 @@ impl TypeStore {
         self.intern(node)
     }
 
+    /// Find the largest explicit product width anywhere in an expression,
+    /// including generic arguments and existential domains and bodies. Elaboration
+    /// uses this to infer the tuple-width bound after adding trait receivers.
     fn max_tuple_arity(&self, id: TypeId) -> usize {
         match &self[id] {
             Type::Product(items) => items.len().max(
@@ -312,6 +329,9 @@ impl TypeStore {
     }
 
     /// Validate a nominal application and cache its direct structural view.
+    /// Check parameter arity and finite domains before resolving the declared body.
+    /// A cached specialization needs no repeated elaboration; opaque declarations
+    /// view themselves, and predefined `Bytes` exposes `List<Byte>`.
     fn nominal(
         &mut self,
         name: &str,
@@ -384,6 +404,10 @@ impl TypeStore {
         Ok(id)
     }
 
+    /// Resolve syntax into this store using the supplied parameter substitutions.
+    /// Validate names, constructor arities, finite domains, and binder scopes;
+    /// normalize algebraic expressions and canonicalize existential binder names
+    /// so alpha-equivalent packages receive the same identifier.
     pub(crate) fn resolve(
         &mut self,
         expr: &syntax::TypeExpr,
@@ -455,6 +479,9 @@ impl TypeStore {
         Ok(self.intern(node))
     }
 
+    /// Expand closed finite parameter domains into every concrete substitution.
+    /// Multiple parameters form a Cartesian product; an empty parameter list
+    /// yields one empty environment so non-generic declarations expand once.
     pub(crate) fn parameter_environments(
         &mut self,
         parameters: &[syntax::Binder],
@@ -463,6 +490,9 @@ impl TypeStore {
         self.parameter_environments_with_parent(parameters, &BTreeMap::new(), line)
     }
 
+    /// Extend an enclosing trait environment with member parameters. Domains
+    /// resolve in an empty environment, so they cannot depend on earlier choices.
+    /// Reject duplicate or shadowing names and stop at the specialization guard.
     fn parameter_environments_with_parent(
         &mut self,
         parameters: &[syntax::Binder],
@@ -616,6 +646,8 @@ pub struct TypeDisplay<'a> {
     id: TypeId,
 }
 impl fmt::Display for TypeDisplay<'_> {
+    /// Follow child identifiers to render semantic types, preserving nominal
+    /// names, product nesting, and the scope of existential sum alternatives.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let store = self.store;
         match &store[self.id] {
@@ -709,6 +741,11 @@ pub(crate) struct Specification {
     pub(crate) features: Vec<Primitive>,
 }
 
+/// Register declarations and transform the parsed document into ground signatures.
+/// Reject definition cycles before resolving bodies, validate even unused types,
+/// expand finite parameters, and lower trait members by adding their receivers.
+/// Finally check overload intersections and infer the explicit tuple-width bound.
+/// Feature signatures remain separate goals and never become available morphisms.
 pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, ValidationError> {
     let builtins = builtin_names();
     let mut types = TypeStore::default();
@@ -848,6 +885,9 @@ pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, Va
     })
 }
 
+/// Reject dependency cycles through structural bodies and parameter domains before
+/// recursive elaboration starts. Bound variables do not create declaration edges;
+/// active DFS marks distinguish a cycle from an already completed dependency.
 fn check_definition_cycles(document: &syntax::Document) -> Result<(), ValidationError> {
     let names = document
         .types
@@ -879,6 +919,7 @@ fn check_definition_cycles(document: &syntax::Document) -> Result<(), Validation
         graph.insert(declaration.name.clone(), references);
     }
 
+    /// Return a declaration on a back edge, or mark its dependency subtree complete.
     fn visit(
         name: &str,
         graph: &BTreeMap<String, BTreeSet<String>>,
@@ -921,6 +962,8 @@ fn check_definition_cycles(document: &syntax::Document) -> Result<(), Validation
     Ok(())
 }
 
+/// Collect referenced declaration names for cycle detection, descending into type
+/// arguments and algebraic expressions while respecting existential binder scope.
 fn collect_references(
     expr: &syntax::TypeExpr,
     declared: &BTreeSet<&str>,
@@ -965,6 +1008,9 @@ fn invalid(line: usize, message: impl Into<String>) -> ValidationError {
     ValidationError::Invalid(format!("line {line}: {}", message.into()))
 }
 
+/// Reject any two ground specializations of the same function name whose input
+/// contracts overlap, including specializations produced from one generic source.
+/// Report a common accepted input as a witness; no specificity tie-break is used.
 fn check_overloads(primitives: &[Primitive], types: &mut TypeStore) -> Result<(), ValidationError> {
     let mut by_name = BTreeMap::<&str, Vec<&Primitive>>::new();
     for primitive in primitives {
@@ -994,6 +1040,9 @@ fn check_overloads(primitives: &[Primitive], types: &mut TypeStore) -> Result<()
     Ok(())
 }
 
+/// Construct one common input for two contracts by matching sum alternatives and
+/// product components. Other types overlap only by identical nominal/structural
+/// identifiers; declared views do not make separate nominal types interchangeable.
 fn overlap_witness(left: TypeId, right: TypeId, types: &mut TypeStore) -> Option<TypeId> {
     match (types[left].clone(), types[right].clone()) {
         (Type::Sum(items), _) => items

@@ -60,6 +60,9 @@ impl Args {
     }
 }
 
+/// Parse CLI options, validate the input, and write a report to the chosen output.
+/// Map I/O, invalid declarations, unresolved goals, and resource exhaustion to
+/// the documented exit codes after handling any report-writing failure.
 fn main() -> ExitCode {
     let args = Args::parse();
     let options = args.validation_options();

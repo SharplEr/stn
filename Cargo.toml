@@ -7,3 +7,4 @@ description = "Parser and bounded proof validator for Semantic Types Notation"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+indexmap = "2.7"
