@@ -2,6 +2,51 @@
 use super::{Type, TypeId, TypeStore};
 use std::collections::HashMap;
 
+#[test]
+fn elaboration_moves_metadata_and_copies_only_additional_specializations() {
+    let document = crate::syntax::SourceText::new(
+        "DEFINITIONS:\nA\nB\nKinds = A | B\n/// Function description\nf<T from Kinds>: T -> T\nFEATURES:\n/// Feature description\nsame<T from Kinds>: T -> T\n".to_owned(),
+    )
+    .parse()
+    .unwrap();
+    let function_name = document.functions[0].name.as_ptr();
+    let function_description = document.functions[0].description.as_ptr();
+    let feature_name = document.features[0].name.as_ptr();
+    let feature_description = document.features[0].description.as_ptr();
+    let specification = super::elaborate(document).unwrap();
+
+    for (signatures, name, description) in [
+        (
+            &specification.primitives,
+            function_name,
+            function_description,
+        ),
+        (&specification.features, feature_name, feature_description),
+    ] {
+        assert_eq!(signatures.len(), 2);
+        assert_ne!(signatures[0].input, signatures[1].input);
+        assert!(
+            signatures
+                .iter()
+                .all(|signature| signature.input == signature.output)
+        );
+        assert_eq!(
+            signatures
+                .iter()
+                .filter(|signature| signature.name.as_ptr() == name)
+                .count(),
+            1,
+        );
+        assert_eq!(
+            signatures
+                .iter()
+                .filter(|signature| signature.description.as_ptr() == description)
+                .count(),
+            1,
+        );
+    }
+}
+
 impl TypeStore {
     /// Transfer a type from a different store, translating every child identifier.
     /// Nominal applications are checked against this store's source declarations.

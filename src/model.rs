@@ -4,6 +4,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    iter::repeat_n,
     ops::Index,
 };
 
@@ -601,19 +602,23 @@ impl TypeStore {
     /// Expand a function or feature into ground signatures using its finite parameters.
     /// This only resolves signatures; the caller decides whether they are available
     /// morphisms or verification goals and applies the corresponding name checks.
+    /// Move source metadata into the last specialization and clone only earlier copies.
     fn expand_function(
         &mut self,
-        function: &syntax::FunctionDecl,
+        function: syntax::FunctionDecl,
     ) -> Result<Vec<Primitive>, ValidationError> {
-        self.parameter_environments(&function.parameters, function.line)?
+        let environments = self.parameter_environments(&function.parameters, function.line)?;
+        let metadata = repeat_n((function.name, function.description), environments.len());
+        environments
             .into_iter()
-            .map(|env| {
+            .zip(metadata)
+            .map(|(env, (name, description))| {
                 Ok(Primitive {
-                    name: function.name.clone(),
+                    name,
                     input: self.resolve(&function.input, &env, function.line)?,
                     output: self.resolve(&function.output, &env, function.line)?,
                     line: function.line,
-                    description: function.description.clone(),
+                    description,
                     substitutions: env,
                 })
             })
@@ -690,13 +695,14 @@ impl TypeStore {
     /// Expand standalone morphisms and lower trait members by inserting their receiver.
     fn expand_primitives(
         &mut self,
-        document: &syntax::Document,
+        functions: Vec<syntax::FunctionDecl>,
+        traits: &[syntax::TraitDecl],
     ) -> Result<Vec<Primitive>, ValidationError> {
         let mut primitives = Vec::new();
-        for function in &document.functions {
+        for function in functions {
             primitives.extend(self.expand_function(function)?);
         }
-        for declaration in &document.traits {
+        for declaration in traits {
             for trait_env in
                 self.parameter_environments(&declaration.parameters, declaration.line)?
             {
@@ -741,12 +747,12 @@ impl TypeStore {
     /// Check feature names and expand each signature without adding it as a primitive.
     fn expand_features(
         &mut self,
-        declarations: &[syntax::FeatureDecl],
+        declarations: Vec<syntax::FeatureDecl>,
     ) -> Result<Vec<Primitive>, ValidationError> {
         let mut names = HashSet::new();
         let mut features = Vec::new();
         for feature in declarations {
-            if !names.insert(&feature.name) {
+            if !names.insert(feature.name.clone()) {
                 return Err(invalid(
                     feature.line,
                     format!("duplicate feature '{}'", feature.name),
@@ -904,13 +910,14 @@ pub(crate) struct Specification {
 /// expand finite parameters, and lower trait members by adding their receivers.
 /// Finally check overload intersections and infer the explicit tuple-width bound.
 /// Feature signatures remain separate goals and never become available morphisms.
-pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, ValidationError> {
+/// Consume the parsed document so signature metadata can move into ground declarations.
+pub(crate) fn elaborate(document: syntax::Document) -> Result<Specification, ValidationError> {
     let mut types = TypeStore::default();
-    types.register_declarations(document)?;
-    check_definition_cycles(document)?;
-    let mut tuple_arity = types.validate_declarations(document)?;
-    let primitives = types.expand_primitives(document)?;
-    let features = types.expand_features(&document.features)?;
+    types.register_declarations(&document)?;
+    check_definition_cycles(&document)?;
+    let mut tuple_arity = types.validate_declarations(&document)?;
+    let primitives = types.expand_primitives(document.functions, &document.traits)?;
+    let features = types.expand_features(document.features)?;
     check_overloads(&primitives, &mut types)?;
     for function in primitives.iter().chain(&features) {
         tuple_arity = tuple_arity

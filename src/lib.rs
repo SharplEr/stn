@@ -239,48 +239,7 @@ pub fn validate_source(
     source: String,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
-    let source = syntax::SourceText::new(source);
-    let document = source.parse()?;
-    let model::Specification {
-        tuple_arity,
-        mut types,
-        primitives,
-        features,
-    } = model::elaborate(&document)?;
-    let (proofs, statuses) =
-        search::search(&primitives, &features, &mut types, options, tuple_arity);
-    let reports = features
-        .into_iter()
-        .zip(statuses)
-        .map(|(feature, status)| {
-            let suffix = if feature.substitutions.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<{}>",
-                    feature
-                        .substitutions
-                        .iter()
-                        .map(|(n, t)| format!("{n}={}", types.display(*t)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            FeatureReport {
-                name: format!("{}{suffix}", feature.name),
-                input: feature.input,
-                output: feature.output,
-                line: feature.line,
-                status,
-            }
-        })
-        .collect();
-    Ok(ValidationReport {
-        types,
-        proofs,
-        max_tuple_arity: tuple_arity,
-        source_name: source_name.into(),
-        options: options.clone(),
-        features: reports,
-    })
+    let specification = model::elaborate(syntax::SourceText::new(source).parse()?)?;
+    let result = search::search(specification, options);
+    Ok(result.into_report(source_name))
 }

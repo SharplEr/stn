@@ -120,7 +120,14 @@ Library callers construct positive limits with `NonZeroUsize::new(value)`;
 `max_depth` remains a `usize` because zero depth is valid.
 
 The public API exposes feature statuses, typed proof trees, costs and source
-references. `ValidationReport::types` owns the shared `TypeStore`: type nodes,
+references. Proof search consumes the elaborated `Specification` and returns
+one `SearchResult` owning its type store, compacted proof DAG, ground feature
+signatures, outcomes, and search bounds. Its `into_report` method combines goals
+with their outcomes, formats specialization names, and moves the stores into
+the public report. `validate_source` orchestrates parsing, elaboration, search,
+and report construction.
+
+`ValidationReport::types` owns the shared `TypeStore`: type nodes,
 the nominal declaration registry, and cached structural views. Nodes reference
 their children through `TypeId`, and interning gives equal normalized types the
 same identifier. Identifiers belong to one store; they cannot be compared across
@@ -159,8 +166,10 @@ to a declaration; the completed AST owns its strings and can outlive the buffer.
 The CLI transfers its input buffer to `validate_source`. `SourceText` has no
 source lifetime parameter. The source inspection helper `as_str` and the shorthand
 parser used by tests live in `src/syntax/tests.rs` and are absent from the public
-API. Elaboration remains a sequence of registration, cycle and body validation,
-morphism and feature expansion, and overload checks. Proof traversal separates
+API. Elaboration consumes the parsed document and proceeds through registration,
+cycle and body validation, morphism and feature expansion, and overload checks.
+Function and feature names and descriptions move into one ground specialization;
+additional specializations receive copies of this metadata. Proof traversal separates
 endpoint checks, node contracts, and cost calculation; search handles interruptions
 outside its successful result processing.
 

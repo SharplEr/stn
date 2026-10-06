@@ -1,7 +1,7 @@
 //! A finite type universe and a shortest-path agenda over inference hyperedges.
 use crate::{
-    FeatureStatus, Type, TypeId, TypeStore, ValidationOptions,
-    model::Primitive,
+    FeatureReport, FeatureStatus, Type, TypeId, TypeStore, ValidationOptions, ValidationReport,
+    model::{Primitive, Specification},
     proof::{self, Cost, Proof, ProofId, ProofStore, Rule},
 };
 use indexmap::IndexSet;
@@ -397,46 +397,120 @@ impl Agenda {
     }
 }
 
-/// Run bounded search and return feature outcomes with their owned witness graph.
+/// Owner of the searched type graph, proof DAG, ground goals, and their outcomes.
+/// Keeping these together preserves the stores required by every returned identifier.
+pub(crate) struct SearchResult {
+    /// Type nodes from elaboration and intermediate types interned during search.
+    types: TypeStore,
+    /// Checked witnesses retained for the feature outcomes.
+    proofs: ProofStore,
+    /// Ground feature signatures and substitutions, in specialization order.
+    features: Vec<Primitive>,
+    /// One outcome per ground feature, in the same order as `features`.
+    statuses: Vec<FeatureStatus>,
+    /// Synthesized tuple-width bound inferred from the consumed specification.
+    tuple_arity: usize,
+    /// Universe profile and resource limits used to obtain these outcomes.
+    options: ValidationOptions,
+}
+
+impl SearchResult {
+    /// Retain reported witnesses and their premises, remapping every feature root
+    /// to the compacted DAG. Interrupted searches retain no uncertified candidates.
+    fn retain_feature_proofs(&mut self) {
+        let mut roots = self
+            .statuses
+            .iter()
+            .filter_map(|status| match status {
+                FeatureStatus::Proved { proofs } => Some(proofs.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        self.proofs.retain_roots(&mut roots);
+        let mut roots = roots.into_iter();
+        for status in &mut self.statuses {
+            if let FeatureStatus::Proved { proofs } = status {
+                for id in proofs {
+                    *id = roots.next().expect("every reported root was retained");
+                }
+            }
+        }
+    }
+
+    /// Attach outcomes to ground goals and render their parameter substitutions.
+    /// Transfer the owning graphs and search bounds into the report without cloning them.
+    pub(crate) fn into_report(self, source_name: impl Into<String>) -> ValidationReport {
+        let features = self
+            .features
+            .into_iter()
+            .zip(self.statuses)
+            .map(|(feature, status)| {
+                let suffix = if feature.substitutions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<{}>",
+                        feature
+                            .substitutions
+                            .iter()
+                            .map(|(n, t)| format!("{n}={}", self.types.display(*t)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                FeatureReport {
+                    name: format!("{}{suffix}", feature.name),
+                    input: feature.input,
+                    output: feature.output,
+                    line: feature.line,
+                    status,
+                }
+            })
+            .collect();
+        ValidationReport {
+            types: self.types,
+            proofs: self.proofs,
+            max_tuple_arity: self.tuple_arity,
+            source_name: source_name.into(),
+            options: self.options,
+            features,
+        }
+    }
+}
+
+/// Consume a checked specification and return one owner of its search results.
 /// Any interrupted run makes all goals incomplete, so partial candidates cannot
 /// be reported as certified minima. Compact successful roots and their premises
 /// before returning, rewriting every reported identifier to the compacted store.
-pub(crate) fn search(
-    primitives: &[Primitive],
-    features: &[Primitive],
-    types: &mut TypeStore,
-    options: &ValidationOptions,
-    tuple_arity: usize,
-) -> (ProofStore, Vec<FeatureStatus>) {
-    let mut proofs = ProofStore::default();
-    let mut statuses = run(
+pub(crate) fn search(specification: Specification, options: &ValidationOptions) -> SearchResult {
+    let Specification {
+        tuple_arity,
+        mut types,
         primitives,
         features,
-        types,
+    } = specification;
+    let mut proofs = ProofStore::default();
+    let statuses = run(
+        &primitives,
+        &features,
+        &mut types,
         &mut proofs,
         options,
         tuple_arity,
     )
     .unwrap_or_else(|reason| incomplete_statuses(features.len(), reason));
-    let mut roots = statuses
-        .iter()
-        .filter_map(|status| match status {
-            FeatureStatus::Proved { proofs } => Some(proofs.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    proofs.retain_roots(&mut roots);
-    let mut roots = roots.into_iter();
-    for status in &mut statuses {
-        if let FeatureStatus::Proved { proofs } = status {
-            for id in proofs {
-                *id = roots.next().expect("every reported root was retained");
-            }
-        }
-    }
-    (proofs, statuses)
+    let mut result = SearchResult {
+        types,
+        proofs,
+        features,
+        statuses,
+        tuple_arity,
+        options: options.clone(),
+    };
+    result.retain_feature_proofs();
+    result
 }
 
 /// Convert an interrupted run into uncertified outcomes for every requested goal.

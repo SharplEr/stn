@@ -64,7 +64,7 @@ impl ProofStore {
         types: &TypeStore,
     ) -> Result<(), ValidationError> {
         let document = syntax::SourceText::new(source).parse()?;
-        let mut specification = model::elaborate(&document)?;
+        let mut specification = model::elaborate(document)?;
         let mut imported = Self::default();
         let root = imported
             .import(root, self, types, &mut specification.types)
