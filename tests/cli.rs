@@ -56,14 +56,16 @@ fn cli_writes_report_to_requested_file() {
 #[test]
 fn cli_distinguishes_configuration_io_unresolved_and_resource_errors() {
     assert_code(&binary().arg("--unknown").output().unwrap(), 2);
-    assert_code(
-        &binary()
-            .args(["--max-proofs", "0"])
-            .arg(example("examples/search.stypes"))
+    for flag in ["--max-proofs", "--max-types", "--max-steps"] {
+        // A missing input would produce an I/O error if parsing accepted zero.
+        let output = binary()
+            .args([flag, "0"])
+            .arg(temporary())
             .output()
-            .unwrap(),
-        2,
-    );
+            .unwrap();
+        assert_code(&output, 2);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(flag));
+    }
     assert_code(&binary().arg(temporary()).output().unwrap(), 1);
     let input = temporary();
     std::fs::write(&input, "DEFINITIONS:\nA\nB\nFEATURES:\nf: A -> B\n").unwrap();
@@ -80,6 +82,37 @@ fn cli_distinguishes_configuration_io_unresolved_and_resource_errors() {
         .unwrap();
     assert_code(&incomplete, 4);
     assert!(String::from_utf8_lossy(&incomplete.stdout).contains("SEARCH_INCOMPLETE"));
+}
+
+#[test]
+fn cli_reports_validation_and_output_failures_with_context() {
+    let input = temporary();
+    for source in [
+        "DEFINITIONS:\nFEATURES:\nbroken: () ->\n",
+        "DEFINITIONS:\nA\nFEATURES:\nunknown: A -> Missing\n",
+    ] {
+        std::fs::write(&input, source).unwrap();
+        let output = binary().arg(&input).output().unwrap();
+        assert_code(&output, 2);
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&input.display().to_string()));
+    }
+
+    // Writing the report must succeed before an unresolved-feature code is returned.
+    std::fs::write(&input, "DEFINITIONS:\nA\nB\nFEATURES:\ngoal: A -> B\n").unwrap();
+    let directory = temporary();
+    std::fs::create_dir(&directory).unwrap();
+    let output = binary()
+        .arg(&input)
+        .arg("-o")
+        .arg(&directory)
+        .output()
+        .unwrap();
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    assert_code(&output, 1);
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&directory.display().to_string()));
 }
 
 #[test]

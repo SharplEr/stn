@@ -1,8 +1,8 @@
 use crate::{ValidationError, syntax};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::Index,
 };
@@ -43,8 +43,8 @@ pub enum Type {
 pub struct TypeStore {
     /// Canonical nodes stored once, with hash lookup and stable insertion indices.
     nodes: IndexSet<Type>,
-    /// Source declarations indexed by their unique nominal names.
-    declarations: BTreeMap<String, TypeInfo>,
+    /// Source declarations indexed by name, retaining their registration order.
+    declarations: IndexMap<String, TypeInfo>,
     /// Resolved bodies of nominal specializations, including predefined `Bytes`.
     shapes: HashMap<TypeId, TypeId>,
 }
@@ -164,13 +164,13 @@ impl TypeStore {
 
     /// Alternatives available in a supplied value, exposing the direct body of
     /// a nominal sum. Non-sum types contribute their original nominal identity.
-    pub(crate) fn source_variants(&self, id: TypeId) -> BTreeSet<TypeId> {
+    pub(crate) fn source_variants(&self, id: TypeId) -> IndexSet<TypeId> {
         self.outer_variants(id).into_iter().collect()
     }
 
     /// Alternatives explicitly accepted by a morphism's input signature.
     /// Only anonymous sums are expanded; a nominal input stays a single type.
-    pub(crate) fn handled_variants(&self, id: TypeId) -> BTreeSet<TypeId> {
+    pub(crate) fn handled_variants(&self, id: TypeId) -> IndexSet<TypeId> {
         match &self[id] {
             Type::Sum(items) => items.iter().copied().collect(),
             _ => [id].into_iter().collect(),
@@ -216,7 +216,7 @@ impl TypeStore {
     /// Collect ground subexpressions, specializing existential bodies only for enumeration.
     /// The output set also marks visited nodes. Existential witnesses add concrete
     /// body types to the universe, without granting package construction or unpacking.
-    pub(crate) fn collect(&mut self, id: TypeId, out: &mut BTreeSet<TypeId>) {
+    pub(crate) fn collect(&mut self, id: TypeId, out: &mut IndexSet<TypeId>) {
         if !out.insert(id) {
             return;
         }
@@ -482,6 +482,8 @@ impl TypeStore {
     /// Expand closed finite parameter domains into every concrete substitution.
     /// Multiple parameters form a Cartesian product; an empty parameter list
     /// yields one empty environment so non-generic declarations expand once.
+    /// Environments keep name order because they also become canonical proof
+    /// substitutions, whose ordered entries are hashed and displayed.
     pub(crate) fn parameter_environments(
         &mut self,
         parameters: &[syntax::Binder],
@@ -500,7 +502,7 @@ impl TypeStore {
         line: usize,
     ) -> Result<Vec<BTreeMap<String, TypeId>>, ValidationError> {
         let mut envs = vec![parent.clone()];
-        let mut names = BTreeSet::new();
+        let mut names = HashSet::new();
         for binder in parameters {
             if !names.insert(binder.name.clone()) || parent.contains_key(&binder.name) {
                 return Err(invalid(
@@ -538,11 +540,33 @@ impl TypeStore {
         Ok(envs)
     }
 
+    /// Expand a function or feature into ground signatures using its finite parameters.
+    /// This only resolves signatures; the caller decides whether they are available
+    /// morphisms or verification goals and applies the corresponding name checks.
+    fn expand_function(
+        &mut self,
+        function: &syntax::FunctionDecl,
+    ) -> Result<Vec<Primitive>, ValidationError> {
+        self.parameter_environments(&function.parameters, function.line)?
+            .into_iter()
+            .map(|env| {
+                Ok(Primitive {
+                    name: function.name.clone(),
+                    input: self.resolve(&function.input, &env, function.line)?,
+                    output: self.resolve(&function.output, &env, function.line)?,
+                    line: function.line,
+                    description: function.description.clone(),
+                    substitutions: env,
+                })
+            })
+            .collect()
+    }
+
     /// Collect declared ground families and their shapes, stopping at the type limit.
     /// The snapshot keeps declaration borrows separate from mutable graph construction.
     pub(crate) fn collect_declarations(
         &mut self,
-        out: &mut BTreeSet<TypeId>,
+        out: &mut IndexSet<TypeId>,
         limit: usize,
     ) -> Result<(), String> {
         let declarations = self
@@ -725,7 +749,7 @@ pub(crate) struct Primitive {
     pub(crate) line: usize,
     /// Semantic prose attached to the source declaration.
     pub(crate) description: String,
-    /// Concrete choices for declaration and enclosing trait parameters.
+    /// Concrete choices in name order for canonical proof hashing and display.
     pub(crate) substitutions: BTreeMap<String, TypeId>,
 }
 
@@ -803,16 +827,7 @@ pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, Va
     }
     let mut primitives = Vec::new();
     for function in &document.functions {
-        for env in types.parameter_environments(&function.parameters, function.line)? {
-            primitives.push(Primitive {
-                name: function.name.clone(),
-                input: types.resolve(&function.input, &env, function.line)?,
-                output: types.resolve(&function.output, &env, function.line)?,
-                line: function.line,
-                description: function.description.clone(),
-                substitutions: env,
-            });
-        }
+        primitives.extend(types.expand_function(function)?);
     }
     for declaration in &document.traits {
         for trait_env in types.parameter_environments(&declaration.parameters, declaration.line)? {
@@ -851,7 +866,7 @@ pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, Va
             }
         }
     }
-    let mut names = BTreeSet::new();
+    let mut names = HashSet::new();
     let mut features = Vec::new();
     for feature in &document.features {
         if !names.insert(&feature.name) {
@@ -860,16 +875,7 @@ pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, Va
                 format!("duplicate feature '{}'", feature.name),
             ));
         }
-        for env in types.parameter_environments(&feature.parameters, feature.line)? {
-            features.push(Primitive {
-                name: feature.name.clone(),
-                input: types.resolve(&feature.input, &env, feature.line)?,
-                output: types.resolve(&feature.output, &env, feature.line)?,
-                line: feature.line,
-                description: feature.description.clone(),
-                substitutions: env,
-            });
-        }
+        features.extend(types.expand_function(feature)?);
     }
     check_overloads(&primitives, &mut types)?;
     for function in primitives.iter().chain(&features) {
@@ -888,23 +894,24 @@ pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, Va
 /// Reject dependency cycles through structural bodies and parameter domains before
 /// recursive elaboration starts. Bound variables do not create declaration edges;
 /// active DFS marks distinguish a cycle from an already completed dependency.
+/// Visit declarations and references in insertion order for reproducible diagnostics.
 fn check_definition_cycles(document: &syntax::Document) -> Result<(), ValidationError> {
     let names = document
         .types
         .iter()
         .map(|item| item.name.as_str())
         .chain(document.traits.iter().map(|item| item.name.as_str()))
-        .collect::<BTreeSet<_>>();
-    let mut graph = BTreeMap::<String, BTreeSet<String>>::new();
+        .collect::<HashSet<_>>();
+    let mut graph = IndexMap::<String, IndexSet<String>>::new();
     for declaration in &document.traits {
-        let mut references = BTreeSet::new();
+        let mut references = IndexSet::new();
         for binder in &declaration.parameters {
             collect_references(&binder.domain, &names, &mut references);
         }
         graph.insert(declaration.name.clone(), references);
     }
     for declaration in &document.types {
-        let mut references = BTreeSet::new();
+        let mut references = IndexSet::new();
         for binder in &declaration.parameters {
             collect_references(&binder.domain, &names, &mut references);
         }
@@ -922,9 +929,9 @@ fn check_definition_cycles(document: &syntax::Document) -> Result<(), Validation
     /// Return a declaration on a back edge, or mark its dependency subtree complete.
     fn visit(
         name: &str,
-        graph: &BTreeMap<String, BTreeSet<String>>,
-        visiting: &mut BTreeSet<String>,
-        visited: &mut BTreeSet<String>,
+        graph: &IndexMap<String, IndexSet<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Option<String> {
         if visited.contains(name) {
             return None;
@@ -944,8 +951,8 @@ fn check_definition_cycles(document: &syntax::Document) -> Result<(), Validation
         None
     }
 
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
     for name in graph.keys() {
         if let Some(cycle) = visit(name, &graph, &mut visiting, &mut visited) {
             let line = document
@@ -966,8 +973,8 @@ fn check_definition_cycles(document: &syntax::Document) -> Result<(), Validation
 /// arguments and algebraic expressions while respecting existential binder scope.
 fn collect_references(
     expr: &syntax::TypeExpr,
-    declared: &BTreeSet<&str>,
-    out: &mut BTreeSet<String>,
+    declared: &HashSet<&str>,
+    out: &mut IndexSet<String>,
 ) {
     match expr {
         syntax::TypeExpr::Name(name, args) => {
@@ -995,7 +1002,7 @@ fn collect_references(
     }
 }
 
-fn builtin_names() -> BTreeSet<&'static str> {
+fn builtin_names() -> HashSet<&'static str> {
     [
         "Boolean", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
         "Byte", "Float32", "Float64", "None", "String", "Bytes", "List", "Set", "Map",
@@ -1011,8 +1018,9 @@ fn invalid(line: usize, message: impl Into<String>) -> ValidationError {
 /// Reject any two ground specializations of the same function name whose input
 /// contracts overlap, including specializations produced from one generic source.
 /// Report a common accepted input as a witness; no specificity tie-break is used.
+/// Check name groups in first-occurrence order so error selection is reproducible.
 fn check_overloads(primitives: &[Primitive], types: &mut TypeStore) -> Result<(), ValidationError> {
-    let mut by_name = BTreeMap::<&str, Vec<&Primitive>>::new();
+    let mut by_name = IndexMap::<&str, Vec<&Primitive>>::new();
     for primitive in primitives {
         by_name.entry(&primitive.name).or_default().push(primitive);
     }

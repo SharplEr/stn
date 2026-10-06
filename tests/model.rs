@@ -1,4 +1,4 @@
-use stn_validator::{FeatureStatus, Type, ValidationOptions, check_proof, validate_source};
+use stn_validator::{FeatureStatus, Type, ValidationOptions, validate_source};
 
 #[test]
 fn equal_types_share_identifiers_and_nested_nodes() {
@@ -71,10 +71,18 @@ fn external_proof_identifiers_are_translated_between_stores() {
     let reordered = "DEFINITIONS:\nA\nB\nUnused = List<B>\nP = (A, B)\nFEATURES:\npart: P -> A\n";
     let other = validate_source("other", reordered, &ValidationOptions::default()).unwrap();
     assert_ne!(report.features[0].input, other.features[0].input);
-    check_proof(reordered, &report.types, &report.proofs, proofs[0]).unwrap();
+    report
+        .proofs
+        .check(proofs[0], reordered, &report.types)
+        .unwrap();
     // The verifier must use the new declaration's shape, not the imported store's cache.
     let changed = reordered.replace("P = (A, B)", "P = List<B>");
-    assert!(check_proof(&changed, &report.types, &report.proofs, proofs[0]).is_err());
+    assert!(
+        report
+            .proofs
+            .check(proofs[0], &changed, &report.types)
+            .is_err()
+    );
 }
 
 #[test]
@@ -85,7 +93,10 @@ fn external_existential_proof_translates_bound_variables_and_witnesses() {
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         panic!("expected proof")
     };
-    check_proof(source, &report.types, &report.proofs, proofs[0]).unwrap();
+    report
+        .proofs
+        .check(proofs[0], source, &report.types)
+        .unwrap();
 }
 
 #[test]
@@ -99,6 +110,6 @@ fn external_proof_import_preserves_nominal_lifts_and_synthesized_sums() {
         panic!("expected proof");
     };
     for proof in proofs {
-        check_proof(source, &report.types, &report.proofs, *proof).unwrap();
+        report.proofs.check(*proof, source, &report.types).unwrap();
     }
 }

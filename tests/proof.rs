@@ -1,6 +1,5 @@
 use stn_validator::{
-    Cost, FeatureStatus, ProofNode, ProofStore, Rule, ValidationOptions, check_proof,
-    validate_source,
+    Cost, FeatureStatus, ProofNode, ProofStore, Rule, ValidationOptions, validate_source,
 };
 
 #[test]
@@ -27,7 +26,7 @@ fn shared_premises_count_each_occurrence_without_copying_nodes() {
         rules: 3
     });
     assert_eq!(report.proofs.find(proof), Some(root));
-    check_proof(source, &report.types, &report.proofs, root).unwrap();
+    report.proofs.check(root, source, &report.types).unwrap();
 }
 
 #[test]
@@ -47,7 +46,7 @@ fn compaction_retains_multiple_roots_and_reuses_identical_feature_proofs() {
     assert_eq!(roots[0], roots[2]);
     assert_ne!(roots[0], roots[1]);
     for root in roots {
-        check_proof(source, &report.types, &report.proofs, root).unwrap();
+        report.proofs.check(root, source, &report.types).unwrap();
     }
 }
 
@@ -63,7 +62,7 @@ fn external_checker_rejects_cyclic_and_missing_premises() {
     // the inserted parent itself, so importing it must detect the cycle.
     let mut cyclic = ProofStore::default();
     let cycle = cyclic.insert(report.proofs[proofs[0]].clone());
-    let error = check_proof(source, &report.types, &cyclic, cycle).unwrap_err();
+    let error = cyclic.check(cycle, source, &report.types).unwrap_err();
     assert!(error.to_string().contains("cycle"));
 
     let mut wrong_child = report.proofs[proofs[0]].clone();
@@ -73,6 +72,6 @@ fn external_checker_rejects_cyclic_and_missing_premises() {
     };
     let mut missing = ProofStore::default();
     let root = missing.insert(wrong_child);
-    let error = check_proof(source, &report.types, &missing, root).unwrap_err();
+    let error = missing.check(root, source, &report.types).unwrap_err();
     assert!(error.to_string().contains("invalid proof identifier"));
 }

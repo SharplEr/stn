@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use stn_validator::{Cost, FeatureStatus, ValidationOptions, ValidationReport, validate_source};
 
 fn validate(defs: &str, goals: &str) -> ValidationReport {
@@ -333,11 +334,11 @@ fn resource_exhaustion_never_reports_underivability_or_minimum_cost() {
     let source = "DEFINITIONS:\nA\nB\nf: A -> B\nFEATURES:\ng: A -> B\n";
     for options in [
         ValidationOptions {
-            max_types: 1,
+            max_types: NonZeroUsize::new(1).unwrap(),
             ..ValidationOptions::default()
         },
         ValidationOptions {
-            max_steps: 1,
+            max_steps: NonZeroUsize::new(1).unwrap(),
             ..ValidationOptions::default()
         },
     ] {
@@ -364,38 +365,52 @@ fn complete_depth_zero_universe_can_certify_failure() {
 
 #[test]
 fn proof_alternative_limit_is_respected_and_results_are_deterministic() {
-    let source = "DEFINITIONS:\nA\nB\nf: A -> B\ng: A -> B\nFEATURES:\nh: A -> B\n";
+    let sources = [
+        "DEFINITIONS:\nA\nB\nf: A -> B\ng: A -> B\nFEATURES:\nh: A -> B\n",
+        // Exercise universe generation, collection lifts, carried errors, and
+        // reachable-type diagnostics as well as direct primitive alternatives.
+        "DEFINITIONS:\nA\nB\nDocId\nScore\nE\nF\n\
+         MatchedDocs = Set<DocId>\nScores = Set<Score>\n\
+         start: A -> MatchedDocs | E\nscore: DocId -> Score\n\
+         otherScore: DocId -> Score\nfinish: Scores -> B | F\n\
+         FEATURES:\ngoal: A -> B | E | F\nmissing: A -> String\n",
+    ];
     let options = ValidationOptions {
-        max_proofs: 1,
+        max_proofs: NonZeroUsize::new(1).unwrap(),
         ..ValidationOptions::default()
     };
-    let report = validate_source("input", source, &options).unwrap();
-    let FeatureStatus::Proved { proofs } = &report.features[0].status else {
-        unreachable!()
-    };
-    assert_eq!(proofs.len(), 1);
-    assert_eq!(
-        report.to_string(),
-        validate_source("input", source, &options)
-            .unwrap()
-            .to_string()
-    );
+    for source in sources {
+        let report = validate_source("input", source, &options).unwrap();
+        let FeatureStatus::Proved { proofs } = &report.features[0].status else {
+            panic!("expected a proof: {report}");
+        };
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(
+            report.to_string(),
+            validate_source("input", source, &options)
+                .unwrap()
+                .to_string()
+        );
+    }
 }
 
 #[test]
 fn external_checker_rejects_an_incorrect_cost_and_rule() {
-    use stn_validator::{ProofNode, Rule, check_proof};
+    use stn_validator::{ProofNode, Rule};
     let source = "DEFINITIONS:\nA\nB\nf: A -> B\nFEATURES:\ng: A -> B\n";
     let report = validate_source("input", source, &ValidationOptions::default()).unwrap();
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
-    check_proof(source, &report.types, &report.proofs, proofs[0]).unwrap();
+    report
+        .proofs
+        .check(proofs[0], source, &report.types)
+        .unwrap();
     let mut wrong_cost = report.proofs[proofs[0]].clone();
     wrong_cost.cost.functions = 0;
     let mut edited = report.proofs.clone();
     let wrong_cost = edited.insert(wrong_cost);
-    assert!(check_proof(source, &report.types, &edited, wrong_cost).is_err());
+    assert!(edited.check(wrong_cost, source, &report.types).is_err());
     let mut wrong_rule = report.proofs[proofs[0]].clone();
     wrong_rule.node = ProofNode::Inference {
         rule: Rule::Identity,
@@ -406,7 +421,7 @@ fn external_checker_rejects_an_incorrect_cost_and_rule() {
         rules: 1,
     };
     let wrong_rule = edited.insert(wrong_rule);
-    assert!(check_proof(source, &report.types, &edited, wrong_rule).is_err());
+    assert!(edited.check(wrong_rule, source, &report.types).is_err());
 }
 
 #[test]

@@ -114,6 +114,11 @@ assert!(!report.has_unresolved_features());
 println!("{report}");
 ```
 
+`ValidationOptions::max_proofs`, `max_types`, and `max_steps` use `NonZeroUsize`.
+Clap rejects zero values during argument parsing, before opening the input file.
+Library callers construct positive limits with `NonZeroUsize::new(value)`;
+`max_depth` remains a `usize` because zero depth is valid.
+
 The public API exposes feature statuses, typed proof trees, costs and source
 references. `ValidationReport::types` owns the shared `TypeStore`: type nodes,
 the nominal declaration registry, and cached structural views. Nodes reference
@@ -126,10 +131,14 @@ independent validation runs. Use `report.types[id]` to inspect a node and
 `ProofId` roots; inference children are identifiers in the same store.
 Use `report.proofs[id]` to inspect a record and
 `report.proofs.expression(id, &report.types)` to format a witness.
-`check_proof(source, &report.types, &report.proofs, id)` verifies it without
+`report.proofs.check(id, source, &report.types)` verifies it without
 asserting minimality, translating its type and proof identifiers into independent
 stores. Externally constructed records can be added with `ProofStore::insert`;
 the checker rejects invalid rules, costs, missing children, and cycles.
+`ProofStore` owns verification and import operations. Each operation creates
+its own `ProofChecker` or `ProofImporter` traversal state, keeping graph ownership
+separate from temporary visiting marks and identifier translations. Search checks
+its witnesses against the already resolved declarations without reparsing source.
 `syntax::parse` preserves semantic descriptions in its AST.
 
 Both stores use `indexmap::IndexSet` to combine hash lookup with access by index,
@@ -137,13 +146,23 @@ keeping each node in a single collection. Inserting an equal node reuses its
 index; appending a new node preserves all existing identifiers. Proof compaction
 rebuilds the set and explicitly remaps the surviving roots and child references.
 
+Type identifier sets also use `IndexSet` for hash lookup and deterministic
+insertion-order iteration. Set equality is independent of insertion order.
+Before rule indexing, the search universe is explicitly sorted by type structure.
+
+Lookup-only tables and membership-only sets use `HashMap` and `HashSet`.
+Traversed declaration and search collections use `IndexMap` and `IndexSet` for
+reproducible iteration. Parameter environments and proof substitutions retain
+`BTreeMap` for canonical name order in proof hashing and display.
+
 - `src/syntax.rs`: line lexer and recursive descent parser.
 - `src/model.rs`: interned type graph and declaration registry, finite elaboration, trait lowering,
   cycle detection, existential normalization and overload intersection checks.
 - `src/search.rs`: type-universe construction and an indexed weighted agenda.
 - `src/proof.rs`: typed proof nodes, inference premises and witness checking.
 - `src/lib.rs`: validation API and report formatting.
-- `src/main.rs`: declarative `clap` argument schema, files and exit codes.
+- `src/main.rs`: declarative `clap` arguments and command execution through `Result`,
+  with contextual errors handled once at the program boundary.
 
 The agenda implements generalized Dijkstra search over morphism pairs.
 Unary rules and collection lifts are indexed by premise pairs; composition uses

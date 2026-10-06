@@ -4,16 +4,18 @@ use crate::{
     model::Primitive,
     proof::{self, Cost, Proof, ProofId, ProofStore, Rule},
 };
+use indexmap::IndexSet;
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{BinaryHeap, HashMap, HashSet},
 };
 
 /// Input/output pair of type identifiers interned in the search universe.
 type Pair = (usize, usize);
 /// Unary rule instances indexed by their required child morphism's type pair.
 /// Each entry lists the resulting pair and the rule that produces it.
-type UnaryIndex = BTreeMap<Pair, Vec<(Pair, Rule)>>;
+/// Only key lookup is used; premise order comes from the search agenda.
+type UnaryIndex = HashMap<Pair, Vec<(Pair, Rule)>>;
 
 /// Work allowance shared by type generation, rule indexing, and agenda operations.
 /// Exhaustion stops certification and yields an incomplete-search diagnostic.
@@ -34,14 +36,14 @@ impl Budget {
 /// Admit a new universe member without charging duplicates against the type cap.
 /// The bound applies to admitted search types, not every node interned in the store.
 fn insert_type(
-    known: &mut BTreeSet<TypeId>,
+    known: &mut IndexSet<TypeId>,
     ty: TypeId,
     options: &ValidationOptions,
 ) -> Result<bool, String> {
     if known.contains(&ty) {
         return Ok(false);
     }
-    if known.len() >= options.max_types {
+    if known.len() >= options.max_types.get() {
         return Err(format!(
             "type limit ({}) reached; increase --max-types",
             options.max_types
@@ -54,25 +56,26 @@ fn insert_type(
 /// Collect all ground declarations, callable endpoints, feature goals, and their
 /// subexpressions, repeatedly exposing newly discovered direct nominal bodies.
 /// Explicit shapes bypass the synthesized-depth bound but still obey the type cap.
+/// Preserve discovery order so universe construction stays deterministic.
 fn explicit_types(
     primitives: &[Primitive],
     features: &[Primitive],
     types: &mut TypeStore,
     options: &ValidationOptions,
-) -> Result<BTreeSet<TypeId>, String> {
-    let mut out = BTreeSet::new();
+) -> Result<IndexSet<TypeId>, String> {
+    let mut out = IndexSet::new();
     for p in primitives.iter().chain(features) {
         types.collect(p.input, &mut out);
         types.collect(p.output, &mut out);
     }
-    types.collect_declarations(&mut out, options.max_types)?;
+    types.collect_declarations(&mut out, options.max_types.get())?;
     // Include direct nominal bodies recursively, including predefined Bytes.
     loop {
         let before = out.len();
         for t in out.clone() {
             types.collect(types.shape(t), &mut out);
         }
-        if out.len() > options.max_types {
+        if out.len() > options.max_types.get() {
             return Err("explicit types exceed --max-types".into());
         }
         if before == out.len() {
@@ -84,8 +87,8 @@ fn explicit_types(
 
 /// Seed elementary universe transformations from directed nominal views and product
 /// projections. These pairs guide type generation; they are not proof witnesses.
-fn structural_steps(known: &BTreeSet<TypeId>, types: &TypeStore) -> BTreeSet<(TypeId, TypeId)> {
-    let mut steps = BTreeSet::new();
+fn structural_steps(known: &IndexSet<TypeId>, types: &TypeStore) -> IndexSet<(TypeId, TypeId)> {
+    let mut steps = IndexSet::new();
     for &t in known {
         let shape = types.shape(t);
         if shape != t {
@@ -106,12 +109,12 @@ fn structural_steps(known: &BTreeSet<TypeId>, types: &TypeStore) -> BTreeSet<(Ty
 /// lifts, flattening, narrowing, and carried sum alternatives. Newly synthesized
 /// shapes obey the depth bound; resource exhaustion prevents certification.
 fn relevant_universe(
-    explicit: &BTreeSet<TypeId>,
+    explicit: &IndexSet<TypeId>,
     primitives: &[Primitive],
     types: &mut TypeStore,
     options: &ValidationOptions,
     budget: &mut Budget,
-) -> Result<BTreeSet<TypeId>, String> {
+) -> Result<IndexSet<TypeId>, String> {
     let mut known = explicit.clone();
     let mut steps = structural_steps(explicit, types);
     steps.extend(primitives.iter().map(|p| (p.input, p.output)));
@@ -123,8 +126,23 @@ fn relevant_universe(
         }
     }
     loop {
-        let mut additions = BTreeSet::new();
-        let mut new_steps = BTreeSet::new();
+        let mut additions = IndexSet::new();
+        let mut new_steps = IndexSet::new();
+        // Collection rules share depth admission and directed nominal targets.
+        // Pass the pending sets explicitly so sum extension can update them too.
+        let add_collection_step =
+            |source,
+             node,
+             types: &mut TypeStore,
+             additions: &mut IndexSet<TypeId>,
+             new_steps: &mut IndexSet<(TypeId, TypeId)>| {
+                let target = types.intern(node);
+                if explicit.contains(&target) || types.depth(target) <= options.max_depth {
+                    additions.insert(target);
+                    nominal_steps(source, target, &known, types, new_steps);
+                    new_steps.insert((source, target));
+                }
+            };
         for &(a, b) in &steps {
             let handled = types.handled_variants(a);
             for &source in &known {
@@ -142,29 +160,18 @@ fn relevant_universe(
                     }
                 }
                 let shape = types.shape(source);
-                let target = match types[shape] {
+                let mapped = match types[shape] {
                     Type::List(t) if t == a => Some(Type::List(b)),
                     Type::Set(t) if t == a => Some(Type::Set(b)),
                     Type::Map(k, t) if t == a => Some(Type::Map(k, b)),
                     _ => None,
                 };
-                if let Some(node) = target {
-                    let target = types.intern(node);
-                    if explicit.contains(&target) || types.depth(target) <= options.max_depth {
-                        additions.insert(target);
-                        nominal_steps(source, target, &known, types, &mut new_steps);
-                        new_steps.insert((source, target));
-                    }
-                }
-                if let (Type::List(t), Type::List(result)) = (&types[shape], &types[b]) {
-                    if *t == a {
-                        let target = types.intern(Type::List(*result));
-                        if explicit.contains(&target) || types.depth(target) <= options.max_depth {
-                            additions.insert(target);
-                            nominal_steps(source, target, &known, types, &mut new_steps);
-                            new_steps.insert((source, target));
-                        }
-                    }
+                let flattened = match (&types[shape], &types[b]) {
+                    (Type::List(t), Type::List(result)) if *t == a => Some(Type::List(*result)),
+                    _ => None,
+                };
+                for node in [mapped, flattened].into_iter().flatten() {
+                    add_collection_step(source, node, types, &mut additions, &mut new_steps);
                 }
             }
         }
@@ -195,12 +202,7 @@ fn relevant_universe(
                     _ => None,
                 };
                 if let Some(node) = candidate {
-                    let t = types.intern(node);
-                    if explicit.contains(&t) || types.depth(t) <= options.max_depth {
-                        additions.insert(t);
-                        nominal_steps(source, t, &known, types, &mut new_steps);
-                        new_steps.insert((source, t));
-                    }
+                    add_collection_step(source, node, types, &mut additions, &mut new_steps);
                 }
             }
         }
@@ -222,9 +224,9 @@ fn relevant_universe(
 fn nominal_steps(
     source: TypeId,
     result_shape: TypeId,
-    known: &BTreeSet<TypeId>,
+    known: &IndexSet<TypeId>,
     types: &TypeStore,
-    steps: &mut BTreeSet<(TypeId, TypeId)>,
+    steps: &mut IndexSet<(TypeId, TypeId)>,
 ) {
     if matches!(types[source], Type::Named(..)) && types.shape(source) != result_shape {
         for &target in known {
@@ -239,14 +241,14 @@ fn nominal_steps(
 /// union. Incremental subset construction avoids fixed-width bit-mask limits;
 /// the work and type caps stop its potentially exponential growth explicitly.
 fn add_sums(
-    known: &mut BTreeSet<TypeId>,
+    known: &mut IndexSet<TypeId>,
     candidates: &[TypeId],
     types: &mut TypeStore,
     options: &ValidationOptions,
     budget: &mut Budget,
 ) -> Result<(), String> {
     // Incremental powerset generation has no word-size-dependent bit masks.
-    let mut sums = BTreeSet::<TypeId>::new();
+    let mut sums = IndexSet::<TypeId>::new();
     for &atom in candidates {
         let mut next = vec![atom];
         for &sum in &sums {
@@ -266,12 +268,12 @@ fn add_sums(
 /// Start with atoms and their sums, then add collections, ordered products, and
 /// their sums at each depth. Resource caps can interrupt this exhaustive profile.
 fn exhaustive_universe(
-    explicit: &BTreeSet<TypeId>,
+    explicit: &IndexSet<TypeId>,
     types: &mut TypeStore,
     options: &ValidationOptions,
     budget: &mut Budget,
     arity: usize,
-) -> Result<BTreeSet<TypeId>, String> {
+) -> Result<IndexSet<TypeId>, String> {
     let mut known = explicit.clone();
     insert_type(&mut known, types.intern(Type::Unit), options)?;
     let atoms = known
@@ -334,17 +336,17 @@ struct Agenda {
     /// Minimum-cost queue; proof records live exclusively in the proof store.
     heap: BinaryHeap<Reverse<(Cost, ProofId)>>,
     /// Lowest candidate cost offered so far for each input/output type pair.
-    best_offered: BTreeMap<Pair, Cost>,
-    /// Proof identifiers offered at each pair's best cost, used for deduplication.
-    seen: BTreeMap<Pair, BTreeSet<ProofId>>,
+    best_offered: HashMap<Pair, Cost>,
+    /// Proof identifiers offered at each pair's best cost, checked without iteration.
+    seen: HashMap<Pair, HashSet<ProofId>>,
 }
 impl Agenda {
     fn new(limit: usize) -> Self {
         Self {
             limit,
             heap: BinaryHeap::new(),
-            best_offered: BTreeMap::new(),
-            seen: BTreeMap::new(),
+            best_offered: HashMap::new(),
+            seen: HashMap::new(),
         }
     }
     /// Offer a candidate at its pair's best known cost, resetting alternatives
@@ -462,7 +464,7 @@ fn run(
         return Ok(Vec::new());
     }
     let mut budget = Budget {
-        remaining: options.max_steps,
+        remaining: options.max_steps.get(),
     };
     let explicit = explicit_types(primitives, features, types, options)?;
     let known = if options.exhaustive {
@@ -476,13 +478,13 @@ fn run(
         .iter()
         .enumerate()
         .map(|(i, t)| (*t, i))
-        .collect::<BTreeMap<_, _>>();
-    let mut agenda = Agenda::new(options.max_proofs);
+        .collect::<HashMap<_, _>>();
+    let mut agenda = Agenda::new(options.max_proofs.get());
     let mut unary = UnaryIndex::new();
     let mut restrictions = vec![Vec::new(); universe.len()];
     let mut sums = vec![Vec::new(); universe.len()];
     let shapes = universe.iter().map(|t| types.shape(*t)).collect::<Vec<_>>();
-    let mut fanouts = BTreeMap::<Pair, usize>::new();
+    let mut fanouts = HashMap::<Pair, usize>::new();
     for (i, &a) in universe.iter().enumerate() {
         agenda.offer(
             (i, i),
@@ -574,9 +576,9 @@ fn run(
         .iter()
         .map(|f| (ids[&f.input], ids[&f.output]))
         .collect::<Vec<_>>();
-    let mut settled = BTreeMap::<Pair, Vec<ProofId>>::new();
-    let mut outgoing = vec![BTreeSet::new(); universe.len()];
-    let mut incoming = vec![BTreeSet::new(); universe.len()];
+    let mut settled = HashMap::<Pair, Vec<ProofId>>::new();
+    let mut outgoing = vec![IndexSet::new(); universe.len()];
+    let mut incoming = vec![IndexSet::new(); universe.len()];
     while let Some(p) = agenda.pop() {
         let (input, output, cost) = {
             let node = &proofs[p];
@@ -600,7 +602,7 @@ fn run(
         if alternatives
             .first()
             .is_some_and(|best| proofs[*best].cost < cost)
-            || alternatives.len() >= options.max_proofs
+            || alternatives.len() >= options.max_proofs.get()
         {
             continue;
         }
@@ -664,21 +666,15 @@ fn run(
         }
         for &c in &outgoing[a] {
             for &q in &settled[&(a, c)] {
-                if let Some(&t) = fanouts.get(&(b, c)) {
-                    agenda.offer(
-                        (a, t),
-                        proofs.inference(input, universe[t], Rule::Fanout, vec![p, q]),
-                        proofs,
-                        &mut budget,
-                    )?;
-                }
-                if let Some(&t) = fanouts.get(&(c, b)) {
-                    agenda.offer(
-                        (a, t),
-                        proofs.inference(input, universe[t], Rule::Fanout, vec![q, p]),
-                        proofs,
-                        &mut budget,
-                    )?;
+                for (outputs, children) in [((b, c), [p, q]), ((c, b), [q, p])] {
+                    if let Some(&t) = fanouts.get(&outputs) {
+                        agenda.offer(
+                            (a, t),
+                            proofs.inference(input, universe[t], Rule::Fanout, children.to_vec()),
+                            proofs,
+                            &mut budget,
+                        )?;
+                    }
                 }
             }
         }
@@ -687,7 +683,7 @@ fn run(
     for (feature, &goal) in features.iter().zip(&goals) {
         if let Some(witnesses) = settled.get(&goal) {
             for &p in witnesses {
-                proof::check(p, proofs, primitives, types)?;
+                proofs.check_against(p, primitives, types)?;
             }
             statuses.push(FeatureStatus::Proved {
                 proofs: witnesses.clone(),

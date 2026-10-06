@@ -56,7 +56,7 @@ whether two uses of a type mistakenly represent different meanings.
 The following concrete lexical conventions are **proposed** for version 1:
 
 - Source is UTF-8. LF and CRLF line endings are accepted.
-- Identifiers match [A-Za-z_][A-Za-z0-9_]* and are case-sensitive.
+- Identifiers match `[A-Za-z_][A-Za-z0-9_]*` and are case-sensitive.
 - Type-name capitalization is a convention, not a syntactic requirement.
 - DEFINITIONS, FEATURES, exists, and from are reserved words.
 - Punctuation tokens are colon, equals, pipe, arrow, dot, angle brackets,

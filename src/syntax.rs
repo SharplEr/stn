@@ -29,13 +29,14 @@ pub struct TypeDecl {
     pub line: usize,
 }
 
-/// Source signature of a standalone morphism before finite parameter expansion.
+/// Source signature of a standalone morphism or feature before parameter expansion.
 /// A qualified name alone does not introduce an implicit receiver.
+/// Its containing `Document` section determines whether it is a morphism or a goal.
 #[derive(Clone, Debug)]
 pub struct FunctionDecl {
-    /// Function name, possibly qualified with dots.
+    /// Function or feature name, possibly qualified with dots.
     pub name: String,
-    /// Finite parameters local to this function declaration.
+    /// Finite parameters local to this signature.
     pub parameters: Vec<Binder>,
     /// Explicit input expression to the left of `->`.
     pub input: TypeExpr,
@@ -82,22 +83,10 @@ pub struct MemberDecl {
 }
 
 /// Source feature signature to be expanded into ground proof-search goals.
-/// Proving a feature never makes its signature available as a morphism.
-#[derive(Clone, Debug)]
-pub struct FeatureDecl {
-    /// Goal name, unique in the feature namespace.
-    pub name: String,
-    /// Finite parameters whose choices each require a separate proof.
-    pub parameters: Vec<Binder>,
-    /// Input available to the requested computation.
-    pub input: TypeExpr,
-    /// Exact output required by the goal.
-    pub output: TypeExpr,
-    /// Semantic description of the feature's intended behavior.
-    pub description: String,
-    /// One-based declaration line in the original source.
-    pub line: usize,
-}
+/// Functions and features have identical syntax, so they share a record type.
+/// Features stay in `Document::features`, have unique names, and never become
+/// available morphisms, including after a successful proof.
+pub type FeatureDecl = FunctionDecl;
 
 /// A `name from domain` binder used by finite parameters and existential types.
 /// Elaboration resolves the domain and checks that it supplies permitted choices.
@@ -586,7 +575,7 @@ fn parse_member(line: &str, line_no: usize, description: String) -> Result<Membe
 }
 
 /// Parse a named, optionally parameterized feature goal with an explicit arrow.
-/// The separate AST record lets elaboration retain it as a goal, not a morphism.
+/// Its placement in `Document::features` keeps it a goal during elaboration.
 fn parse_feature(
     line: &str,
     line_no: usize,
@@ -779,15 +768,7 @@ impl TypeParser<'_> {
             self.expect(TokenKind::RParen)?;
             return Ok(first);
         }
-        let mut items = vec![first];
-        loop {
-            items.push(self.parse_sum()?);
-            if self.consume(TokenKind::Comma) {
-                continue;
-            }
-            self.expect(TokenKind::RParen)?;
-            break;
-        }
+        let items = self.parse_comma_separated(vec![first], TokenKind::RParen)?;
         Ok(TypeExpr::Product(items))
     }
 
@@ -795,18 +776,29 @@ impl TypeParser<'_> {
     /// can themselves be sums or nested applications; arity is checked later.
     fn parse_named(&mut self) -> Result<TypeExpr, ParseError> {
         let name = self.take_name()?;
-        let mut args = Vec::new();
-        if self.consume(TokenKind::Less) {
-            loop {
-                args.push(self.parse_sum()?);
-                if self.consume(TokenKind::Comma) {
-                    continue;
-                }
-                self.expect(TokenKind::Greater)?;
-                break;
+        let args = if self.consume(TokenKind::Less) {
+            self.parse_comma_separated(Vec::new(), TokenKind::Greater)?
+        } else {
+            Vec::new()
+        };
+        Ok(TypeExpr::Name(name, args))
+    }
+
+    /// Parse at least one more full type, then consume the required closing token.
+    /// Products pass their already parsed first component; named applications
+    /// start empty. Empty arguments and trailing commas remain syntax errors.
+    fn parse_comma_separated(
+        &mut self,
+        mut items: Vec<TypeExpr>,
+        closing: TokenKind,
+    ) -> Result<Vec<TypeExpr>, ParseError> {
+        loop {
+            items.push(self.parse_sum()?);
+            if !self.consume(TokenKind::Comma) {
+                self.expect(closing)?;
+                return Ok(items);
             }
         }
-        Ok(TypeExpr::Name(name, args))
     }
 
     fn take_name(&mut self) -> Result<String, ParseError> {

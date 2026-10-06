@@ -7,7 +7,7 @@ pub mod syntax;
 
 pub use model::{Type, TypeDisplay, TypeId, TypeStore};
 pub use proof::{Cost, Proof, ProofId, ProofNode, ProofStore, Rule};
-use std::fmt;
+use std::{fmt, num::NonZeroUsize};
 
 /// Selects the admitted intermediate types and bounds proof-search resources.
 /// Explicitly declared shapes remain available regardless of the depth bound.
@@ -15,12 +15,12 @@ use std::fmt;
 pub struct ValidationOptions {
     /// Maximum nesting depth of synthesized anonymous collections and products.
     pub max_depth: usize,
-    /// Maximum number of distinct equal-minimum-cost proofs retained per pair.
-    pub max_proofs: usize,
-    /// Maximum number of types admitted to the search universe.
-    pub max_types: usize,
-    /// Work budget shared by universe construction and proof search.
-    pub max_steps: usize,
+    /// Positive maximum of distinct equal-minimum-cost proofs retained per pair.
+    pub max_proofs: NonZeroUsize,
+    /// Positive maximum of types admitted to the search universe.
+    pub max_types: NonZeroUsize,
+    /// Positive work budget shared by universe construction and proof search.
+    pub max_steps: NonZeroUsize,
     /// Enumerate the complete constructor universe of doc.md §9.2. This can
     /// require exponentially many types even at depth zero (anonymous sums).
     pub exhaustive: bool,
@@ -29,9 +29,9 @@ impl Default for ValidationOptions {
     fn default() -> Self {
         Self {
             max_depth: 2,
-            max_proofs: 5,
-            max_types: 20_000,
-            max_steps: 2_000_000,
+            max_proofs: NonZeroUsize::new(5).unwrap(),
+            max_types: NonZeroUsize::new(20_000).unwrap(),
+            max_steps: NonZeroUsize::new(2_000_000).unwrap(),
             exhaustive: false,
         }
     }
@@ -43,7 +43,7 @@ impl Default for ValidationOptions {
 pub enum ValidationError {
     /// The document does not follow the concrete notation grammar.
     Parse(syntax::ParseError),
-    /// Declarations, validation options, or a supplied proof are invalid.
+    /// Declarations or a supplied proof are invalid.
     Invalid(String),
     /// A finite parameter environment exceeds the elaboration safety limit.
     ExpansionLimit {
@@ -237,11 +237,6 @@ pub fn validate_source(
     source: &str,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
-    if options.max_proofs == 0 || options.max_types == 0 || options.max_steps == 0 {
-        return Err(ValidationError::Invalid(
-            "max_proofs, max_types and max_steps must be positive".into(),
-        ));
-    }
     let document = syntax::parse(source)?;
     let model::Specification {
         tuple_arity,
@@ -285,29 +280,4 @@ pub fn validate_source(
         options: options.clone(),
         features: reports,
     })
-}
-
-/// Verify an externally stored or modified witness against a specification.
-/// This checks semantic rule instances and costs, independently of search
-/// limits. It does not assert that the proof has minimum cost. Type identifiers
-/// and proof identifiers are translated from the supplied stores into an
-/// independently elaborated source model and a separate proof DAG.
-pub fn check_proof(
-    source: &str,
-    types: &TypeStore,
-    proofs: &ProofStore,
-    root: ProofId,
-) -> Result<(), ValidationError> {
-    let document = syntax::parse(source)?;
-    let mut specification = model::elaborate(&document)?;
-    let mut imported = ProofStore::default();
-    let root = proof::import(root, types, proofs, &mut specification.types, &mut imported)
-        .map_err(ValidationError::Invalid)?;
-    proof::check(
-        root,
-        &imported,
-        &specification.primitives,
-        &specification.types,
-    )
-    .map_err(ValidationError::Invalid)
 }

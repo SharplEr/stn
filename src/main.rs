@@ -1,6 +1,12 @@
-use clap::{Parser, builder::RangedU64ValueParser};
-use std::{io::Write, path::PathBuf, process::ExitCode};
-use stn_validator::{ValidationError, ValidationOptions, validate_source};
+use clap::Parser;
+use std::{
+    fmt,
+    io::{self, Write},
+    num::NonZeroUsize,
+    path::PathBuf,
+    process::ExitCode,
+};
+use stn_validator::{ValidationError, ValidationOptions, ValidationReport, validate_source};
 
 /// Declarative command-line schema parsed by clap before any files are opened.
 /// Field attributes define flags, defaults, and admissible numeric values.
@@ -24,24 +30,21 @@ struct Args {
     /// Maximum equal-minimum-cost proofs per feature
     #[arg(
         long, value_name = "N",
-        default_value_t = ValidationOptions::default().max_proofs,
-        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+        default_value_t = ValidationOptions::default().max_proofs
     )]
-    max_proofs: usize,
+    max_proofs: NonZeroUsize,
     /// Type universe resource limit
     #[arg(
         long, value_name = "N",
-        default_value_t = ValidationOptions::default().max_types,
-        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+        default_value_t = ValidationOptions::default().max_types
     )]
-    max_types: usize,
+    max_types: NonZeroUsize,
     /// Work budget for universe construction and proof search
     #[arg(
         long, value_name = "N",
-        default_value_t = ValidationOptions::default().max_steps,
-        value_parser = RangedU64ValueParser::<usize>::new().range(1..)
+        default_value_t = ValidationOptions::default().max_steps
     )]
-    max_steps: usize,
+    max_steps: NonZeroUsize,
     /// Enumerate the complete bounded constructor universe
     #[arg(long)]
     exhaustive: bool,
@@ -58,52 +61,110 @@ impl Args {
             exhaustive: self.exhaustive,
         }
     }
+
+    /// Read, validate, and write the specification, propagating failures to `main`.
+    /// Determine the feature outcome only after the report has been written.
+    fn run(&self) -> Result<ExitCode, CliError> {
+        let options = self.validation_options();
+        let source = std::fs::read_to_string(&self.input).map_err(|source| CliError::Io {
+            target: self.input.display().to_string(),
+            source,
+        })?;
+        let report = validate_source(self.input.display().to_string(), &source, &options).map_err(
+            |source| CliError::Validation {
+                input: self.input.clone(),
+                source,
+            },
+        )?;
+        self.write_report(&report)?;
+
+        let code = if report.has_incomplete_search() {
+            4
+        } else if report.has_unresolved_features() {
+            3
+        } else {
+            0
+        };
+        Ok(ExitCode::from(code))
+    }
+
+    /// Render the report and write it to the selected destination.
+    /// Attach file or stdout context while propagating the original I/O error.
+    fn write_report(&self, report: &ValidationReport) -> Result<(), CliError> {
+        let rendered = report.to_string();
+        match &self.output {
+            Some(path) => std::fs::write(path, rendered).map_err(|source| CliError::Io {
+                target: path.display().to_string(),
+                source,
+            }),
+            None => std::io::stdout()
+                .lock()
+                .write_all(rendered.as_bytes())
+                .map_err(|source| CliError::Io {
+                    target: "stdout".into(),
+                    source,
+                }),
+        }
+    }
 }
 
-/// Parse CLI options, validate the input, and write a report to the chosen output.
-/// Map I/O, invalid declarations, unresolved goals, and resource exhaustion to
-/// the documented exit codes after handling any report-writing failure.
+/// CLI failure with its original cause and the input or output being processed.
+/// Error presentation and exit-code selection happen once, at the program boundary.
+#[derive(Debug)]
+enum CliError {
+    /// Failure to read the input or write the report.
+    Io {
+        /// Display label of the file or stdout that failed.
+        target: String,
+        /// Original operating-system or UTF-8 decoding error.
+        source: io::Error,
+    },
+    /// Syntax, declaration, or finite-expansion failure in the input document.
+    Validation {
+        /// Input path attached to the library diagnostic.
+        input: PathBuf,
+        /// Original validation failure, retaining its structured category.
+        source: ValidationError,
+    },
+}
+
+impl CliError {
+    /// Map failures to the CLI's documented I/O, invalid-input, and resource codes.
+    fn exit_code(&self) -> ExitCode {
+        ExitCode::from(match self {
+            Self::Io { .. } => 1,
+            Self::Validation {
+                source: ValidationError::ExpansionLimit { .. },
+                ..
+            } => 4,
+            Self::Validation { .. } => 2,
+        })
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { target, source } => write!(f, "{target}: {source}"),
+            Self::Validation { input, source } => write!(f, "{}: {source}", input.display()),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Validation { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Let clap handle argument errors, then execute the command with one error handler.
 fn main() -> ExitCode {
     let args = Args::parse();
-    let options = args.validation_options();
-    let source = match std::fs::read_to_string(&args.input) {
-        Ok(source) => source,
-        Err(error) => {
-            eprintln!("{}: {error}", args.input.display());
-            return ExitCode::from(1);
-        }
-    };
-    let report = match validate_source(args.input.display().to_string(), &source, &options) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("{}: {error}", args.input.display());
-            return ExitCode::from(if matches!(error, ValidationError::ExpansionLimit { .. }) {
-                4
-            } else {
-                2
-            });
-        }
-    };
-    let rendered = report.to_string();
-    let result = match args.output {
-        Some(path) => {
-            std::fs::write(&path, rendered).map_err(|e| format!("{}: {e}", path.display()))
-        }
-        None => std::io::stdout()
-            .lock()
-            .write_all(rendered.as_bytes())
-            .map_err(|e| format!("stdout: {e}")),
-    };
-    if let Err(error) = result {
+    args.run().unwrap_or_else(|error| {
         eprintln!("error: {error}");
-        return ExitCode::from(1);
-    }
-    let code = if report.has_incomplete_search() {
-        4
-    } else if report.has_unresolved_features() {
-        3
-    } else {
-        0
-    };
-    ExitCode::from(code)
+        error.exit_code()
+    })
 }
