@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, ops::Range};
 
 /// Parsed specification before name resolution, normalization, or specialization.
 /// Semantic descriptions and declaration lines are retained for later diagnostics.
@@ -213,240 +213,248 @@ struct Token {
     column: usize,
 }
 
-/// Preprocessed physical line used by the indentation-aware document parser.
-/// Ordinary comments are removed, while semantic description text is retained.
-#[derive(Clone, Debug)]
-struct SourceLine {
-    /// One-based physical line number before preprocessing.
-    number: usize,
-    /// Exact leading spaces or tabs, compared within a trait block.
-    indent: String,
-    /// Declaration text or semantic description without its leading `///`.
+/// Original UTF-8 text and the byte ranges of its preprocessed physical lines.
+/// Own the input `String`; line views borrow this object, so moving it needs
+/// no pointer fixups and never copies the source buffer.
+#[derive(Debug)]
+pub struct SourceText {
+    /// Original text, never rewritten while its line ranges are in use.
     text: String,
-    /// Whether this line contributes to an attached semantic description.
+    /// Indentation and content ranges for every physical line, including comments.
+    lines: Vec<LineSpan>,
+}
+
+/// Byte ranges within one source buffer; no line text is copied or stored twice.
+#[derive(Debug)]
+struct LineSpan {
+    /// Exact leading spaces or tabs, compared within a trait block.
+    indent: Range<usize>,
+    /// Declaration or semantic-description text after trimming and comment removal.
+    text: Range<usize>,
+    /// Whether this line contributes an attached semantic description.
     is_doc: bool,
 }
 
-/// Parse the ordered `DEFINITIONS` and `FEATURES` sections into a source AST.
-/// Attach `///` descriptions to declarations, collect consistently indented trait
-/// blocks, and reject misplaced sections, indentation, or unattached descriptions.
-/// Name resolution and finite-domain validation are deferred to elaboration.
-pub fn parse(source: &str) -> Result<Document, ParseError> {
-    let lines = source_lines(source)?;
-    let mut section = 0_u8;
-    let mut pending_doc = Vec::<String>::new();
-    let mut document = Document {
-        types: Vec::new(),
-        functions: Vec::new(),
-        traits: Vec::new(),
-        features: Vec::new(),
-    };
-    let mut index = 0;
-
-    while index < lines.len() {
-        let line = &lines[index];
-        index += 1;
-        if line.text.trim().is_empty() && !line.is_doc {
-            continue;
-        }
-        if !line.indent.is_empty() {
-            return Err(ParseError::new(
-                line.number,
-                1,
-                "unexpected indentation outside a trait",
-            ));
-        }
-        if line.is_doc {
-            pending_doc.push(line.text.clone());
-            continue;
-        }
-        match line.text.trim() {
-            "DEFINITIONS:" if section == 0 => {
-                reject_pending_description(&pending_doc, line.number)?;
-                section = 1;
-                continue;
-            }
-            "FEATURES:" if section == 1 => {
-                reject_pending_description(&pending_doc, line.number)?;
-                section = 2;
-                continue;
-            }
-            "DEFINITIONS:" | "FEATURES:" => {
-                return Err(ParseError::new(
-                    line.number,
-                    1,
-                    "section is duplicated or out of order",
-                ));
-            }
-            _ => {}
-        }
-        if section == 0 {
-            return Err(ParseError::new(
-                line.number,
-                1,
-                "expected DEFINITIONS: section",
-            ));
-        }
-
-        let description = std::mem::take(&mut pending_doc).join("\n");
-        if section == 1 && is_trait_header(&line.text, line.number)? {
-            let header = parse_header(&line.text, line.number)?;
-            let mut members = Vec::new();
-            let mut trait_indent = None;
-            while index < lines.len() {
-                let member_line = &lines[index];
-                if member_line.text.trim().is_empty() && !member_line.is_doc {
-                    index += 1;
-                    continue;
-                }
-                if member_line.indent.is_empty() {
-                    break;
-                }
-                let expected = trait_indent.get_or_insert_with(|| member_line.indent.clone());
-                if &member_line.indent != expected {
-                    return Err(ParseError::new(
-                        member_line.number,
-                        1,
-                        "trait members must use consistent indentation",
-                    ));
-                }
-                if member_line.is_doc {
-                    pending_doc.push(member_line.text.clone());
-                    index += 1;
-                    continue;
-                }
-                let expected = trait_indent.get_or_insert_with(|| member_line.indent.clone());
-                if &member_line.indent != expected {
-                    return Err(ParseError::new(
-                        member_line.number,
-                        1,
-                        "trait members must use consistent indentation",
-                    ));
-                }
-                let member_description = std::mem::take(&mut pending_doc).join("\n");
-                members.push(
-                    parse_member(&member_line.text, member_line.number, member_description)
-                        .map_err(|mut error| {
-                            error.column += member_line.indent.len();
-                            error
-                        })?,
-                );
-                index += 1;
-            }
-            reject_pending_description(&pending_doc, line.number)?;
-            if members.is_empty() {
-                return Err(ParseError::new(
-                    line.number,
-                    1,
-                    "a trait must contain at least one member",
-                ));
-            }
-            document.traits.push(TraitDecl {
-                name: header.name,
-                parameters: header.parameters,
-                members,
-                description,
-                line: line.number,
-            });
-            continue;
-        }
-
-        if section == 1 {
-            match parse_definition(&line.text, line.number, description)? {
-                Definition::Type(item) => document.types.push(item),
-                Definition::Function(item) => document.functions.push(item),
-            }
-        } else {
-            document
-                .features
-                .push(parse_feature(&line.text, line.number, description)?);
-        }
-    }
-
-    if section == 0 {
-        return Err(ParseError::new(1, 1, "missing DEFINITIONS: section"));
-    }
-    if section != 2 {
-        return Err(ParseError::new(
-            source.lines().count().max(1),
-            1,
-            "missing FEATURES: section",
-        ));
-    }
-    if !pending_doc.is_empty() {
-        return Err(ParseError::new(
-            source.lines().count().max(1),
-            1,
-            "description is not attached to a declaration",
-        ));
-    }
-    Ok(document)
+/// Borrowed view of a preprocessed physical line in a `SourceText`.
+/// All string slices point into the original source buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceLine<'a> {
+    /// One-based physical line number before preprocessing.
+    pub number: usize,
+    /// Exact leading spaces or tabs, compared within a trait block.
+    pub indent: &'a str,
+    /// Declaration text or semantic description without its leading `///`.
+    pub text: &'a str,
+    /// Whether this line contributes to an attached semantic description.
+    pub is_doc: bool,
 }
 
-/// Separate indentation and semantic descriptions from physical source lines,
-/// stripping ordinary comments while preserving line numbers and empty doc lines.
-/// Significant lines may use spaces or tabs for indentation, but cannot mix them.
-fn source_lines(source: &str) -> Result<Vec<SourceLine>, ParseError> {
-    let mut result = Vec::new();
-    for (index, raw) in source.lines().enumerate() {
-        let line_number = index + 1;
-        let without_cr = raw.strip_suffix('\r').unwrap_or(raw);
-        let indent_bytes = without_cr
-            .char_indices()
-            .take_while(|(_, ch)| *ch == ' ' || *ch == '\t')
-            .map(|(offset, ch)| offset + ch.len_utf8())
-            .last()
-            .unwrap_or(0);
-        let indent = without_cr[..indent_bytes].to_owned();
-        let trimmed = without_cr[indent_bytes..].trim_end();
-        let is_ignored =
-            trimmed.is_empty() || (trimmed.starts_with("//") && !trimmed.starts_with("///"));
-        if !is_ignored && indent.contains(' ') && indent.contains('\t') {
+impl SourceText {
+    /// Index physical lines without copying their indentation or content.
+    /// Preserve CRLF line numbers and empty descriptions, remove ordinary comments,
+    /// and reject mixed spaces/tabs only on significant lines. Every stored byte
+    /// range lies on UTF-8 boundaries in the unchanged original buffer.
+    pub fn new(text: String) -> Result<Self, ParseError> {
+        let mut lines = Vec::new();
+        let mut offset = 0;
+        for (index, physical) in text.split_inclusive('\n').enumerate() {
+            let raw = physical.strip_suffix('\n').unwrap_or(physical);
+            let raw = raw.strip_suffix('\r').unwrap_or(raw);
+            let indent_bytes = raw.len() - raw.trim_start_matches([' ', '\t']).len();
+            let indent = &raw[..indent_bytes];
+            let trimmed = raw[indent_bytes..].trim_end();
+            let is_ignored =
+                trimmed.is_empty() || (trimmed.starts_with("//") && !trimmed.starts_with("///"));
+            if !is_ignored && indent.contains(' ') && indent.contains('\t') {
+                return Err(ParseError::new(
+                    index + 1,
+                    1,
+                    "do not mix spaces and tabs in indentation",
+                ));
+            }
+            let (content, prefix_bytes, is_doc) = match trimmed.strip_prefix("///") {
+                Some(doc) => (doc, 3, true),
+                None => (
+                    trimmed
+                        .split_once("//")
+                        .map_or(trimmed, |(before, _)| before),
+                    0,
+                    false,
+                ),
+            };
+            let leading_bytes = content.len() - content.trim_start().len();
+            let start = offset + indent_bytes + prefix_bytes + leading_bytes;
+            lines.push(LineSpan {
+                indent: offset..offset + indent_bytes,
+                text: start..start + content.trim().len(),
+                is_doc,
+            });
+            offset += physical.len();
+        }
+        Ok(Self { text, lines })
+    }
+
+    /// Number of physical lines, using the same trailing-newline convention as `str::lines`.
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// View one zero-based physical line; its number remains one-based.
+    pub fn line(&self, index: usize) -> Option<SourceLine<'_>> {
+        self.lines.get(index).map(|span| SourceLine {
+            number: index + 1,
+            indent: &self.text[span.indent.clone()],
+            text: &self.text[span.text.clone()],
+            is_doc: span.is_doc,
+        })
+    }
+
+    /// Parse the ordered sections into an AST, borrowing line views during parsing.
+    /// Attach descriptions and check trait indentation and section placement;
+    /// name resolution and finite-domain validation are deferred to elaboration.
+    /// AST names and joined descriptions are owned independently of this buffer.
+    pub fn parse(&self) -> Result<Document, ParseError> {
+        let mut section = 0_u8;
+        let mut pending_doc = Vec::<&str>::new();
+        let mut document = Document {
+            types: Vec::new(),
+            functions: Vec::new(),
+            traits: Vec::new(),
+            features: Vec::new(),
+        };
+        let mut index = 0;
+
+        while index < self.line_count() {
+            let line = self.line(index).expect("index is within the line count");
+            index += 1;
+            if line.text.trim().is_empty() && !line.is_doc {
+                continue;
+            }
+            if !line.indent.is_empty() {
+                return Err(ParseError::new(
+                    line.number,
+                    1,
+                    "unexpected indentation outside a trait",
+                ));
+            }
+            if line.is_doc {
+                pending_doc.push(line.text);
+                continue;
+            }
+            match line.text.trim() {
+                "DEFINITIONS:" if section == 0 => {
+                    reject_pending_description(&pending_doc, line.number)?;
+                    section = 1;
+                    continue;
+                }
+                "FEATURES:" if section == 1 => {
+                    reject_pending_description(&pending_doc, line.number)?;
+                    section = 2;
+                    continue;
+                }
+                "DEFINITIONS:" | "FEATURES:" => {
+                    return Err(ParseError::new(
+                        line.number,
+                        1,
+                        "section is duplicated or out of order",
+                    ));
+                }
+                _ => {}
+            }
+            if section == 0 {
+                return Err(ParseError::new(
+                    line.number,
+                    1,
+                    "expected DEFINITIONS: section",
+                ));
+            }
+
+            let description = std::mem::take(&mut pending_doc).join("\n");
+            if section == 1 && is_trait_header(line.text, line.number)? {
+                let header = parse_header(line.text, line.number)?;
+                let mut members = Vec::new();
+                let mut trait_indent = None;
+                while index < self.line_count() {
+                    let member_line = self.line(index).expect("index is within the line count");
+                    if member_line.text.trim().is_empty() && !member_line.is_doc {
+                        index += 1;
+                        continue;
+                    }
+                    if member_line.indent.is_empty() {
+                        break;
+                    }
+                    let expected = trait_indent.get_or_insert(member_line.indent);
+                    if member_line.indent != *expected {
+                        return Err(ParseError::new(
+                            member_line.number,
+                            1,
+                            "trait members must use consistent indentation",
+                        ));
+                    }
+                    if member_line.is_doc {
+                        pending_doc.push(member_line.text);
+                        index += 1;
+                        continue;
+                    }
+                    let member_description = std::mem::take(&mut pending_doc).join("\n");
+                    members.push(
+                        parse_member(member_line.text, member_line.number, member_description)
+                            .map_err(|mut error| {
+                                error.column += member_line.indent.len();
+                                error
+                            })?,
+                    );
+                    index += 1;
+                }
+                reject_pending_description(&pending_doc, line.number)?;
+                if members.is_empty() {
+                    return Err(ParseError::new(
+                        line.number,
+                        1,
+                        "a trait must contain at least one member",
+                    ));
+                }
+                document.traits.push(TraitDecl {
+                    name: header.name,
+                    parameters: header.parameters,
+                    members,
+                    description,
+                    line: line.number,
+                });
+                continue;
+            }
+
+            if section == 1 {
+                match parse_definition(line.text, line.number, description)? {
+                    Definition::Type(item) => document.types.push(item),
+                    Definition::Function(item) => document.functions.push(item),
+                }
+            } else {
+                document
+                    .features
+                    .push(parse_feature(line.text, line.number, description)?);
+            }
+        }
+
+        if section == 0 {
+            return Err(ParseError::new(1, 1, "missing DEFINITIONS: section"));
+        }
+        if section != 2 {
             return Err(ParseError::new(
-                line_number,
+                self.line_count().max(1),
                 1,
-                "do not mix spaces and tabs in indentation",
+                "missing FEATURES: section",
             ));
         }
-        if trimmed.is_empty() {
-            result.push(SourceLine {
-                number: line_number,
-                indent,
-                text: String::new(),
-                is_doc: false,
-            });
-            continue;
+        if !pending_doc.is_empty() {
+            return Err(ParseError::new(
+                self.line_count().max(1),
+                1,
+                "description is not attached to a declaration",
+            ));
         }
-        if let Some(doc) = trimmed.strip_prefix("///") {
-            result.push(SourceLine {
-                number: line_number,
-                indent,
-                text: doc.trim().to_owned(),
-                is_doc: true,
-            });
-            continue;
-        }
-        let content = trimmed
-            .split_once("//")
-            .map_or(trimmed, |(before, _)| before)
-            .trim_end();
-        if content.trim().is_empty() {
-            result.push(SourceLine {
-                number: line_number,
-                indent,
-                text: String::new(),
-                is_doc: false,
-            });
-        } else {
-            result.push(SourceLine {
-                number: line_number,
-                indent,
-                text: content.trim().to_owned(),
-                is_doc: false,
-            });
-        }
+        Ok(document)
     }
-    Ok(result)
 }
 
 fn is_trait_header(line: &str, line_no: usize) -> Result<bool, ParseError> {
@@ -1046,7 +1054,7 @@ fn reject_reserved(name: &str, line: usize, column: usize) -> Result<(), ParseEr
         Ok(())
     }
 }
-fn reject_pending_description(pending: &[String], line: usize) -> Result<(), ParseError> {
+fn reject_pending_description(pending: &[&str], line: usize) -> Result<(), ParseError> {
     if pending.is_empty() {
         Ok(())
     } else {
@@ -1057,3 +1065,6 @@ fn reject_pending_description(pending: &[String], line: usize) -> Result<(), Par
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;

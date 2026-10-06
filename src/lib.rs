@@ -232,12 +232,15 @@ impl fmt::Display for ValidationReport {
 /// Parse and elaborate declarations before searching each ground feature goal.
 /// Declaration failures return an error; proof-search exhaustion is represented
 /// in feature statuses. The returned report owns both graphs needed by its IDs.
+/// Consume the source `String` without copying its buffer. Line preprocessing
+/// uses byte ranges and creates no copies of line substrings.
 pub fn validate_source(
     source_name: impl Into<String>,
-    source: &str,
+    source: String,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
-    let document = syntax::parse(source)?;
+    let source = syntax::SourceText::new(source)?;
+    let document = source.parse()?;
     let model::Specification {
         tuple_arity,
         mut types,

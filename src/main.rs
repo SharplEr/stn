@@ -66,16 +66,15 @@ impl Args {
     /// Determine the feature outcome only after the report has been written.
     fn run(&self) -> Result<ExitCode, CliError> {
         let options = self.validation_options();
-        let source = std::fs::read_to_string(&self.input).map_err(|source| CliError::Io {
+        let input_text = std::fs::read_to_string(&self.input).map_err(|io_error| CliError::Io {
             target: self.input.display().to_string(),
-            source,
+            source: io_error,
         })?;
-        let report = validate_source(self.input.display().to_string(), &source, &options).map_err(
-            |source| CliError::Validation {
+        let report = validate_source(self.input.display().to_string(), input_text, &options)
+            .map_err(|validation_error| CliError::Validation {
                 input: self.input.clone(),
-                source,
-            },
-        )?;
+                source: validation_error,
+            })?;
         self.write_report(&report)?;
 
         let code = if report.has_incomplete_search() {
@@ -97,7 +96,7 @@ impl Args {
                 target: path.display().to_string(),
                 source,
             }),
-            None => std::io::stdout()
+            None => io::stdout()
                 .lock()
                 .write_all(rendered.as_bytes())
                 .map_err(|source| CliError::Io {

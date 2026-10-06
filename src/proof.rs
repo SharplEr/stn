@@ -1,9 +1,9 @@
 //! Typed proof witnesses and a checker independent of the search agenda.
 use crate::model::Primitive;
-use crate::{Type, TypeId, TypeStore, ValidationError, model, syntax};
+use crate::{Type, TypeId, TypeStore};
 use indexmap::IndexSet;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
     ops::Index,
 };
@@ -129,16 +129,6 @@ pub struct ProofStore {
 }
 
 impl ProofStore {
-    /// Number of proof records owned by the store.
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Whether the store contains no records.
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
     /// Look up a record using an identifier originating from this store.
     pub fn get(&self, id: ProofId) -> Option<&Proof> {
         self.nodes.get_index(id.0)
@@ -151,31 +141,10 @@ impl ProofStore {
 
     /// Store a record as supplied, reusing an identifier for an equal record.
     /// Children must refer to this store. This does not check inference semantics
-    /// or costs; use `Self::check` to validate externally constructed evidence.
+    /// or costs. Search checks its results through `Self::check_against`; unit
+    /// tests can also recheck edited external witnesses with the test-only `check`.
     pub fn insert(&mut self, proof: Proof) -> ProofId {
         ProofId(self.nodes.insert_full(proof).0)
-    }
-
-    /// Verify an externally stored or modified witness against a specification.
-    /// `root` belongs to this store, and `types` owns its type identifiers. Parse
-    /// and elaborate the source independently, then translate the witness into
-    /// separate stores before checking its rules, source metadata, and costs.
-    /// This establishes validity, not minimum cost or compliance with search bounds.
-    pub fn check(
-        &self,
-        root: ProofId,
-        source: &str,
-        types: &TypeStore,
-    ) -> Result<(), ValidationError> {
-        let document = syntax::parse(source)?;
-        let mut specification = model::elaborate(&document)?;
-        let mut imported = Self::default();
-        let root = imported
-            .import(root, self, types, &mut specification.types)
-            .map_err(ValidationError::Invalid)?;
-        imported
-            .check_against(root, &specification.primitives, &specification.types)
-            .map_err(ValidationError::Invalid)
     }
 
     /// Validate a witness using already resolved declarations in the same type store.
@@ -193,28 +162,6 @@ impl ProofStore {
             types,
             visiting: HashSet::new(),
             visited: HashSet::new(),
-        }
-        .visit(root)
-    }
-
-    /// Import a witness from another store, translating all proof and type identifiers.
-    /// `root` belongs to `source`; the returned identifier belongs to this store.
-    /// Memoization preserves shared premises and visiting marks reject malformed cycles.
-    fn import(
-        &mut self,
-        root: ProofId,
-        source: &Self,
-        source_types: &TypeStore,
-        target_types: &mut TypeStore,
-    ) -> Result<ProofId, String> {
-        ProofImporter {
-            source_types,
-            source_proofs: source,
-            target_types,
-            target_proofs: self,
-            types: HashMap::new(),
-            proofs: HashMap::new(),
-            visiting: HashSet::new(),
         }
         .visit(root)
     }
@@ -566,82 +513,5 @@ impl ProofChecker<'_> {
     }
 }
 
-/// Translation state for one external witness and all its reachable premises.
-struct ProofImporter<'a> {
-    /// Source type graph owning every endpoint and substitution identifier.
-    source_types: &'a TypeStore,
-    /// Source proof graph owning the input witness and its children.
-    source_proofs: &'a ProofStore,
-    /// Independently elaborated target graph used by the verifier.
-    target_types: &'a mut TypeStore,
-    /// Translated proof records, inserted after their children.
-    target_proofs: &'a mut ProofStore,
-    /// Translation of source type identifiers, computed at most once per node.
-    types: HashMap<TypeId, TypeId>,
-    /// Translation of source proof identifiers, preserving DAG sharing.
-    proofs: HashMap<ProofId, ProofId>,
-    /// Nodes currently being translated, used to detect cycles.
-    visiting: HashSet<ProofId>,
-}
-impl ProofImporter<'_> {
-    /// Translate children before inserting their parent, memoizing both type
-    /// and proof identifiers. Reject missing source nodes and back edges.
-    fn visit(&mut self, id: ProofId) -> Result<ProofId, String> {
-        if let Some(&local) = self.proofs.get(&id) {
-            return Ok(local);
-        }
-        if !self.visiting.insert(id) {
-            return Err("proof contains a cycle".into());
-        }
-        let p = self
-            .source_proofs
-            .get(id)
-            .ok_or("proof contains an invalid proof identifier")?;
-        let input = self
-            .target_types
-            .import(self.source_types, p.input, &mut self.types)?;
-        let output = self
-            .target_types
-            .import(self.source_types, p.output, &mut self.types)?;
-        let node = match &p.node {
-            ProofNode::Primitive {
-                id,
-                name,
-                line,
-                description,
-                substitutions,
-            } => ProofNode::Primitive {
-                id: *id,
-                name: name.clone(),
-                line: *line,
-                description: description.clone(),
-                substitutions: substitutions
-                    .iter()
-                    .map(|(n, t)| {
-                        Ok((
-                            n.clone(),
-                            self.target_types
-                                .import(self.source_types, *t, &mut self.types)?,
-                        ))
-                    })
-                    .collect::<Result<_, String>>()?,
-            },
-            ProofNode::Inference { rule, children } => ProofNode::Inference {
-                rule: *rule,
-                children: children
-                    .iter()
-                    .map(|c| self.visit(*c))
-                    .collect::<Result<_, _>>()?,
-            },
-        };
-        let local = self.target_proofs.insert(Proof {
-            input,
-            output,
-            cost: p.cost,
-            node,
-        });
-        self.visiting.remove(&id);
-        self.proofs.insert(id, local);
-        Ok(local)
-    }
-}
+#[cfg(test)]
+mod tests;

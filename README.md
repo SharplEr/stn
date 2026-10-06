@@ -108,7 +108,7 @@ execute the specified functions.
 ```rust
 use stn_validator::{validate_source, ValidationOptions};
 
-let source = "DEFINITIONS:\nA\nFEATURES:\nsame: A -> A\n";
+let source = String::from("DEFINITIONS:\nA\nFEATURES:\nsame: A -> A\n");
 let report = validate_source("example.stypes", source, &ValidationOptions::default()).unwrap();
 assert!(!report.has_unresolved_features());
 println!("{report}");
@@ -131,15 +131,24 @@ independent validation runs. Use `report.types[id]` to inspect a node and
 `ProofId` roots; inference children are identifiers in the same store.
 Use `report.proofs[id]` to inspect a record and
 `report.proofs.expression(id, &report.types)` to format a witness.
-`report.proofs.check(id, source, &report.types)` verifies it without
-asserting minimality, translating its type and proof identifiers into independent
-stores. Externally constructed records can be added with `ProofStore::insert`;
-the checker rejects invalid rules, costs, missing children, and cycles.
-`ProofStore` owns verification and import operations. Each operation creates
-its own `ProofChecker` or `ProofImporter` traversal state, keeping graph ownership
-separate from temporary visiting marks and identifier translations. Search checks
-its witnesses against the already resolved declarations without reparsing source.
-`syntax::parse` preserves semantic descriptions in its AST.
+`ProofStore` owns verification. Search uses `check_against` with already resolved
+declarations, checking rules, costs, primitive metadata, missing children, and
+cycles without reparsing source. `ProofChecker` owns temporary traversal marks.
+The external-witness helper `ProofStore::check` and its `ProofImporter` live
+with their unit tests in `src/proof/tests.rs`, compiled only with `#[cfg(test)]`.
+These tests translate identifiers into independent stores and deliberately edit
+witnesses to check that invalid evidence is rejected.
+
+`syntax::SourceText` stores one source buffer and byte ranges for physical lines.
+It takes ownership of the input `String` without copying its buffer.
+`line(index)` returns a `SourceLine` view with borrowed indentation and text
+slices. The CLI transfers its input buffer to `validate_source`, whose
+preprocessing and parsing use these views. AST names and joined descriptions are
+owned independently, so parsed documents can outlive the source buffer.
+`validate_source` and `SourceText::new` consume a `String`; callers transfer their
+input buffer into this pipeline. `SourceText` has no source lifetime parameter.
+Source inspection helpers `as_str` and `lines`, and the shorthand parser used by
+tests, live in `src/syntax/tests.rs` and are absent from the public API.
 
 Both stores use `indexmap::IndexSet` to combine hash lookup with access by index,
 keeping each node in a single collection. Inserting an equal node reuses its
