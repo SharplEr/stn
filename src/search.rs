@@ -409,22 +409,15 @@ pub(crate) fn search(
     tuple_arity: usize,
 ) -> (ProofStore, Vec<FeatureStatus>) {
     let mut proofs = ProofStore::default();
-    let mut statuses = match run(
+    let mut statuses = run(
         primitives,
         features,
         types,
         &mut proofs,
         options,
         tuple_arity,
-    ) {
-        Ok(statuses) => statuses,
-        Err(message) => features
-            .iter()
-            .map(|_| FeatureStatus::SearchIncomplete {
-                reason: message.clone(),
-            })
-            .collect(),
-    };
+    )
+    .unwrap_or_else(|reason| incomplete_statuses(features.len(), reason));
     let mut roots = statuses
         .iter()
         .filter_map(|status| match status {
@@ -444,6 +437,11 @@ pub(crate) fn search(
         }
     }
     (proofs, statuses)
+}
+
+/// Convert an interrupted run into uncertified outcomes for every requested goal.
+fn incomplete_statuses(count: usize, reason: String) -> Vec<FeatureStatus> {
+    vec![FeatureStatus::SearchIncomplete { reason }; count]
 }
 
 /// Solve all goals over the chosen finite type universe using generalized Dijkstra.

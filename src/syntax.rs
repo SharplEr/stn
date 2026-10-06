@@ -1,4 +1,8 @@
-use std::{fmt, ops::Range};
+use std::{
+    fmt,
+    iter::{Enumerate, FusedIterator},
+    str::Lines,
+};
 
 /// Parsed specification before name resolution, normalization, or specialization.
 /// Semantic descriptions and declaration lines are retained for later diagnostics.
@@ -138,6 +142,17 @@ impl ParseError {
             message: message.into(),
         }
     }
+
+    /// Construct the diagnostic for a description without a following declaration.
+    fn unattached_description(line: usize) -> Self {
+        Self::new(line, 1, "description is not attached to a declaration")
+    }
+
+    /// Restore the original column after parsing an indentation-free line view.
+    fn with_indent(mut self, indent: &str) -> Self {
+        self.column += indent.len();
+        self
+    }
 }
 
 impl fmt::Display for TypeExpr {
@@ -213,247 +228,426 @@ struct Token {
     column: usize,
 }
 
-/// Original UTF-8 text and the byte ranges of its preprocessed physical lines.
-/// Own the input `String`; line views borrow this object, so moving it needs
-/// no pointer fixups and never copies the source buffer.
+/// Owner of the original UTF-8 source buffer, without any precomputed line index.
+/// Iterators and parser state borrow its slices; the returned AST owns its strings.
 #[derive(Debug)]
 pub struct SourceText {
-    /// Original text, never rewritten while its line ranges are in use.
+    /// Original text, moved into this object without copying or rewriting its buffer.
     text: String,
-    /// Indentation and content ranges for every physical line, including comments.
-    lines: Vec<LineSpan>,
 }
 
-/// Byte ranges within one source buffer; no line text is copied or stored twice.
-#[derive(Debug)]
-struct LineSpan {
-    /// Exact leading spaces or tabs, compared within a trait block.
-    indent: Range<usize>,
-    /// Declaration or semantic-description text after trimming and comment removal.
-    text: Range<usize>,
-    /// Whether this line contributes an attached semantic description.
-    is_doc: bool,
-}
-
-/// Borrowed view of a preprocessed physical line in a `SourceText`.
-/// All string slices point into the original source buffer.
+/// Borrowed view of a significant physical source line.
+/// All text and indentation slices point into the original source buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct SourceLine<'a> {
-    /// One-based physical line number before preprocessing.
+    /// One-based physical line number, including skipped blank and comment lines.
     pub number: usize,
     /// Exact leading spaces or tabs, compared within a trait block.
     pub indent: &'a str,
-    /// Declaration text or semantic description without its leading `///`.
+    /// Trimmed declaration or description text, without an ordinary comment or `///` prefix.
     pub text: &'a str,
-    /// Whether this line contributes to an attached semantic description.
+    /// Whether this line contributes an attached semantic description.
     pub is_doc: bool,
 }
 
-impl SourceText {
-    /// Index physical lines without copying their indentation or content.
-    /// Preserve CRLF line numbers and empty descriptions, remove ordinary comments,
-    /// and reject mixed spaces/tabs only on significant lines. Every stored byte
-    /// range lies on UTF-8 boundaries in the unchanged original buffer.
-    pub fn new(text: String) -> Result<Self, ParseError> {
-        let mut lines = Vec::new();
-        let mut offset = 0;
-        for (index, physical) in text.split_inclusive('\n').enumerate() {
-            let raw = physical.strip_suffix('\n').unwrap_or(physical);
+impl SourceLine<'_> {
+    /// Validate the indentation required by the current document state.
+    fn check_indent(&self, indent: &str) -> Result<(), ParseError> {
+        if self.indent != indent {
+            let message = if indent.is_empty() {
+                "unexpected indentation outside a trait"
+            } else {
+                "trait members must use consistent indentation"
+            };
+            return Err(ParseError::new(self.number, 1, message));
+        }
+        Ok(())
+    }
+}
+
+/// Lazy preprocessing over borrowed physical lines, using constant iterator storage.
+/// Skip ordinary comments and blank lines, retain semantic descriptions, and
+/// validate indentation prefixes only when the consumer requests the next item.
+#[derive(Debug)]
+pub struct SourceLines<'a> {
+    /// Physical lines with their original zero-based indices, before any filtering.
+    physical: Enumerate<Lines<'a>>,
+    /// Diagnostic position of the last consumed physical line, or one for empty input.
+    eof_line: usize,
+}
+
+impl SourceLines<'_> {
+    /// Last consumed physical line; after exhaustion this is the EOF diagnostic position.
+    pub fn eof_line(&self) -> usize {
+        self.eof_line
+    }
+}
+
+impl<'a> Iterator for SourceLines<'a> {
+    type Item = Result<SourceLine<'a>, ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for (index, raw) in self.physical.by_ref() {
+            self.eof_line = index + 1;
             let raw = raw.strip_suffix('\r').unwrap_or(raw);
             let indent_bytes = raw.len() - raw.trim_start_matches([' ', '\t']).len();
             let indent = &raw[..indent_bytes];
             let trimmed = raw[indent_bytes..].trim_end();
-            let is_ignored =
-                trimmed.is_empty() || (trimmed.starts_with("//") && !trimmed.starts_with("///"));
-            if !is_ignored && indent.contains(' ') && indent.contains('\t') {
-                return Err(ParseError::new(
-                    index + 1,
-                    1,
-                    "do not mix spaces and tabs in indentation",
-                ));
-            }
-            let (content, prefix_bytes, is_doc) = match trimmed.strip_prefix("///") {
-                Some(doc) => (doc, 3, true),
+            let (text, is_doc) = match trimmed.strip_prefix("///") {
+                Some(doc) => (doc.trim(), true),
                 None => (
                     trimmed
                         .split_once("//")
-                        .map_or(trimmed, |(before, _)| before),
-                    0,
+                        .map_or(trimmed, |(before, _)| before)
+                        .trim(),
                     false,
                 ),
             };
-            let leading_bytes = content.len() - content.trim_start().len();
-            let start = offset + indent_bytes + prefix_bytes + leading_bytes;
-            lines.push(LineSpan {
-                indent: offset..offset + indent_bytes,
-                text: start..start + content.trim().len(),
+            if text.is_empty() && !is_doc {
+                continue;
+            }
+            let line = SourceLine {
+                number: index + 1,
+                indent,
+                text,
                 is_doc,
-            });
-            offset += physical.len();
+            };
+            return Some(check_indent_prefix(indent, trimmed, line.number).map(|()| line));
         }
-        Ok(Self { text, lines })
+        None
+    }
+}
+
+impl FusedIterator for SourceLines<'_> {}
+
+impl SourceText {
+    /// Take ownership without scanning the source or copying its buffer.
+    pub fn new(text: String) -> Self {
+        Self { text }
     }
 
-    /// Number of physical lines, using the same trailing-newline convention as `str::lines`.
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
+    /// Create a fresh lazy iterator over significant lines, borrowing the source text.
+    pub fn lines(&self) -> SourceLines<'_> {
+        SourceLines {
+            physical: self.text.lines().enumerate(),
+            eof_line: 1,
+        }
     }
 
-    /// View one zero-based physical line; its number remains one-based.
-    pub fn line(&self, index: usize) -> Option<SourceLine<'_>> {
-        self.lines.get(index).map(|span| SourceLine {
-            number: index + 1,
-            indent: &self.text[span.indent.clone()],
-            text: &self.text[span.text.clone()],
-            is_doc: span.is_doc,
+    /// Feed significant lines into the document automaton, then validate its final state.
+    /// Preprocessing and parsing follow source order; malformed input stops consumption.
+    /// AST names and joined descriptions are owned independently of this buffer.
+    pub fn parse(&self) -> Result<Document, ParseError> {
+        let mut lines = self.lines();
+        let mut parser = DocumentParser::new();
+        for line in &mut lines {
+            parser = parser.accept(line?)?;
+        }
+        parser.finish(lines.eof_line())
+    }
+}
+
+/// Required document sections, with their source spelling and missing-header location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Section {
+    /// Declarations of types, morphisms, and traits; required at the document start.
+    Definitions,
+    /// Feature goals; required after all definitions.
+    Features,
+}
+
+impl Section {
+    /// Exact spelling of the section's standalone header.
+    fn header(self) -> &'static str {
+        match self {
+            Self::Definitions => "DEFINITIONS:",
+            Self::Features => "FEATURES:",
+        }
+    }
+
+    /// Recognize a header using the same spellings as expected-header diagnostics.
+    fn from_header(text: &str) -> Option<Self> {
+        [Self::Definitions, Self::Features]
+            .into_iter()
+            .find(|section| section.header() == text)
+    }
+
+    /// Diagnose a missing opening section at the start, or a missing final section at EOF.
+    fn missing_line(self, eof_line: usize) -> usize {
+        match self {
+            Self::Definitions => 1,
+            Self::Features => eof_line,
+        }
+    }
+
+    /// Construct the diagnostic when EOF is reached before this required section.
+    fn missing_error(self, eof_line: usize) -> ParseError {
+        ParseError::new(
+            self.missing_line(eof_line),
+            1,
+            format!("missing {} section", self.header()),
+        )
+    }
+
+    /// Check a present header; all unexpected-header diagnostics are built separately.
+    fn check_header(self, line: SourceLine<'_>) -> Result<(), ParseError> {
+        if line.text != self.header() {
+            return Err(self.unexpected_error(line));
+        }
+        Ok(())
+    }
+
+    /// Distinguish a reordered section from a declaration where a header was required.
+    fn unexpected_error(self, line: SourceLine<'_>) -> ParseError {
+        let message = match Self::from_header(line.text) {
+            Some(_) => "section is duplicated or out of order".to_owned(),
+            None => format!("expected {} section", self.header()),
+        };
+        ParseError::new(line.number, 1, message)
+    }
+
+    /// Reject a section header encountered where only declarations are allowed.
+    fn reject_header(line: SourceLine<'_>) -> Result<(), ParseError> {
+        if Self::from_header(line.text).is_some() {
+            return Err(ParseError::new(
+                line.number,
+                1,
+                "section is duplicated or out of order",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One significant line together with its attached, independently owned description.
+/// The declaration text and indentation still borrow the original source buffer.
+struct DescribedLine<'a> {
+    /// Physical source position, indentation, and declaration text.
+    line: SourceLine<'a>,
+    /// Consecutive semantic description lines, joined once for the AST.
+    description: String,
+}
+
+impl DescribedLine<'_> {
+    /// Parse an indented member and attach original-column context to syntax errors.
+    fn parse_member(self) -> Result<MemberDecl, ParseError> {
+        parse_member(self.line.text, self.line.number, self.description)
+            .map_err(|error| error.with_indent(self.line.indent))
+    }
+}
+
+/// Current state of the document automaton; only trait state owns an unfinished block.
+/// Every accepted declaration determines the state for the next input line.
+enum State<'a> {
+    /// The opening DEFINITIONS header has not yet been accepted.
+    ExpectDefinitions,
+    /// Accept type, function, and trait declarations or the FEATURES header.
+    Definitions,
+    /// Accumulate a trait's members until the next unindented line.
+    Trait(TraitBuilder<'a>),
+    /// Accept feature signatures until the end of input.
+    Features,
+}
+
+impl<'a> State<'a> {
+    /// Check indentation before processing a description or declaration.
+    /// The first significant trait line fixes its block prefix.
+    fn check_indent(&mut self, line: SourceLine<'a>) -> Result<(), ParseError> {
+        match self {
+            Self::Trait(builder) => builder.check_indent(line),
+            _ => line.check_indent(""),
+        }
+    }
+
+    /// Accept a non-description entry and return the next state.
+    /// Append completed declarations directly to their corresponding AST collections.
+    fn accept_entry(
+        self,
+        entry: DescribedLine<'a>,
+        document: &mut Document,
+    ) -> Result<Self, ParseError> {
+        match self {
+            Self::ExpectDefinitions => {
+                Section::Definitions.check_header(entry.line)?;
+                Ok(Self::Definitions)
+            }
+            Self::Definitions => match Section::from_header(entry.line.text) {
+                Some(Section::Features) => Ok(Self::Features),
+                Some(_) => Err(Section::Features.unexpected_error(entry.line)),
+                None if is_trait_header(entry.line.text, entry.line.number)? => {
+                    Ok(Self::Trait(TraitBuilder::new(entry)?))
+                }
+                None => {
+                    match parse_definition(entry.line.text, entry.line.number, entry.description)? {
+                        Definition::Type(item) => document.types.push(item),
+                        Definition::Function(item) => document.functions.push(item),
+                    }
+                    Ok(Self::Definitions)
+                }
+            },
+            Self::Trait(mut builder) => {
+                builder.add_member(entry)?;
+                Ok(Self::Trait(builder))
+            }
+            Self::Features => {
+                Section::reject_header(entry.line)?;
+                document.features.push(parse_feature(
+                    entry.line.text,
+                    entry.line.number,
+                    entry.description,
+                )?);
+                Ok(Self::Features)
+            }
+        }
+    }
+
+    /// Close an active trait at dedent or EOF; all other states pass through unchanged.
+    /// The caller can then feed the same dedented line into the Definitions state.
+    fn finish_trait(
+        self,
+        document: &mut Document,
+        has_pending_description: bool,
+    ) -> Result<Self, ParseError> {
+        match self {
+            Self::Trait(builder) => {
+                document
+                    .traits
+                    .push(builder.finish(has_pending_description)?);
+                Ok(Self::Definitions)
+            }
+            state => Ok(state),
+        }
+    }
+
+    /// Verify that both required headers have been seen when input is exhausted.
+    fn check_finished(&self, eof_line: usize) -> Result<(), ParseError> {
+        match self {
+            Self::ExpectDefinitions => Err(Section::Definitions.missing_error(eof_line)),
+            Self::Definitions | Self::Trait(_) => Err(Section::Features.missing_error(eof_line)),
+            Self::Features => Ok(()),
+        }
+    }
+}
+
+/// Accumulator for one trait declaration while its member lines are being accepted.
+struct TraitBuilder<'a> {
+    /// Owned trait header, semantic description, and members accumulated in source order.
+    declaration: TraitDecl,
+    /// First member or description line's exact indentation, borrowed from the source.
+    indent: Option<&'a str>,
+}
+
+impl<'a> TraitBuilder<'a> {
+    /// Parse the header and begin an empty member block without copying its source slices.
+    fn new(entry: DescribedLine<'a>) -> Result<Self, ParseError> {
+        let header = parse_header(entry.line.text, entry.line.number)?;
+        Ok(Self {
+            declaration: TraitDecl {
+                name: header.name,
+                parameters: header.parameters,
+                members: Vec::new(),
+                description: entry.description,
+                line: entry.line.number,
+            },
+            indent: None,
         })
     }
 
-    /// Parse the ordered sections into an AST, borrowing line views during parsing.
-    /// Attach descriptions and check trait indentation and section placement;
-    /// name resolution and finite-domain validation are deferred to elaboration.
-    /// AST names and joined descriptions are owned independently of this buffer.
-    pub fn parse(&self) -> Result<Document, ParseError> {
-        let mut section = 0_u8;
-        let mut pending_doc = Vec::<&str>::new();
-        let mut document = Document {
-            types: Vec::new(),
-            functions: Vec::new(),
-            traits: Vec::new(),
-            features: Vec::new(),
-        };
-        let mut index = 0;
+    /// Fix the first block prefix and reject later changes, including on descriptions.
+    fn check_indent(&mut self, line: SourceLine<'a>) -> Result<(), ParseError> {
+        let indent = self.indent.get_or_insert(line.indent);
+        line.check_indent(indent)
+    }
 
-        while index < self.line_count() {
-            let line = self.line(index).expect("index is within the line count");
-            index += 1;
-            if line.text.trim().is_empty() && !line.is_doc {
-                continue;
-            }
-            if !line.indent.is_empty() {
-                return Err(ParseError::new(
-                    line.number,
-                    1,
-                    "unexpected indentation outside a trait",
-                ));
-            }
-            if line.is_doc {
-                pending_doc.push(line.text);
-                continue;
-            }
-            match line.text.trim() {
-                "DEFINITIONS:" if section == 0 => {
-                    reject_pending_description(&pending_doc, line.number)?;
-                    section = 1;
-                    continue;
-                }
-                "FEATURES:" if section == 1 => {
-                    reject_pending_description(&pending_doc, line.number)?;
-                    section = 2;
-                    continue;
-                }
-                "DEFINITIONS:" | "FEATURES:" => {
-                    return Err(ParseError::new(
-                        line.number,
-                        1,
-                        "section is duplicated or out of order",
-                    ));
-                }
-                _ => {}
-            }
-            if section == 0 {
-                return Err(ParseError::new(
-                    line.number,
-                    1,
-                    "expected DEFINITIONS: section",
-                ));
-            }
+    /// Parse a member with original-column diagnostics and append it to this trait.
+    fn add_member(&mut self, entry: DescribedLine<'a>) -> Result<(), ParseError> {
+        self.declaration.members.push(entry.parse_member()?);
+        Ok(())
+    }
 
-            let description = std::mem::take(&mut pending_doc).join("\n");
-            if section == 1 && is_trait_header(line.text, line.number)? {
-                let header = parse_header(line.text, line.number)?;
-                let mut members = Vec::new();
-                let mut trait_indent = None;
-                while index < self.line_count() {
-                    let member_line = self.line(index).expect("index is within the line count");
-                    if member_line.text.trim().is_empty() && !member_line.is_doc {
-                        index += 1;
-                        continue;
-                    }
-                    if member_line.indent.is_empty() {
-                        break;
-                    }
-                    let expected = trait_indent.get_or_insert(member_line.indent);
-                    if member_line.indent != *expected {
-                        return Err(ParseError::new(
-                            member_line.number,
-                            1,
-                            "trait members must use consistent indentation",
-                        ));
-                    }
-                    if member_line.is_doc {
-                        pending_doc.push(member_line.text);
-                        index += 1;
-                        continue;
-                    }
-                    let member_description = std::mem::take(&mut pending_doc).join("\n");
-                    members.push(
-                        parse_member(member_line.text, member_line.number, member_description)
-                            .map_err(|mut error| {
-                                error.column += member_line.indent.len();
-                                error
-                            })?,
-                    );
-                    index += 1;
-                }
-                reject_pending_description(&pending_doc, line.number)?;
-                if members.is_empty() {
-                    return Err(ParseError::new(
-                        line.number,
-                        1,
-                        "a trait must contain at least one member",
-                    ));
-                }
-                document.traits.push(TraitDecl {
-                    name: header.name,
-                    parameters: header.parameters,
-                    members,
-                    description,
-                    line: line.number,
-                });
-                continue;
-            }
-
-            if section == 1 {
-                match parse_definition(line.text, line.number, description)? {
-                    Definition::Type(item) => document.types.push(item),
-                    Definition::Function(item) => document.functions.push(item),
-                }
-            } else {
-                document
-                    .features
-                    .push(parse_feature(line.text, line.number, description)?);
-            }
+    /// Require a nonempty member block with no unattached description before emitting it.
+    fn finish(self, has_pending_description: bool) -> Result<TraitDecl, ParseError> {
+        if has_pending_description {
+            return Err(ParseError::unattached_description(self.declaration.line));
         }
-
-        if section == 0 {
-            return Err(ParseError::new(1, 1, "missing DEFINITIONS: section"));
-        }
-        if section != 2 {
+        if self.declaration.members.is_empty() {
             return Err(ParseError::new(
-                self.line_count().max(1),
+                self.declaration.line,
                 1,
-                "missing FEATURES: section",
+                "a trait must contain at least one member",
             ));
         }
-        if !pending_doc.is_empty() {
-            return Err(ParseError::new(
-                self.line_count().max(1),
-                1,
-                "description is not attached to a declaration",
-            ));
+        Ok(self.declaration)
+    }
+}
+
+/// Stateful consumer of preprocessed lines, independent of the source iterator.
+/// State transitions move unfinished traits; borrowed descriptions are joined once
+/// when attached, while completed declarations accumulate in the owned AST.
+struct DocumentParser<'a> {
+    /// Grammar state expected to consume the next significant line.
+    state: State<'a>,
+    /// Semantic description lines waiting for a declaration at the current indentation.
+    descriptions: Vec<&'a str>,
+    /// Completed declarations, grouped by their role in the specification.
+    document: Document,
+}
+
+impl<'a> DocumentParser<'a> {
+    /// Begin before the required opening header, with no accumulated declarations.
+    fn new() -> Self {
+        Self {
+            state: State::ExpectDefinitions,
+            descriptions: Vec::new(),
+            document: Document {
+                types: Vec::new(),
+                functions: Vec::new(),
+                traits: Vec::new(),
+                features: Vec::new(),
+            },
         }
-        Ok(document)
+    }
+
+    /// Consume one line and return the updated parser without copying accumulated data.
+    /// At dedent, finish the trait before processing this same line at top level.
+    /// Descriptions retain source slices; declarations receive one joined string.
+    fn accept(mut self, line: SourceLine<'a>) -> Result<Self, ParseError> {
+        if line.indent.is_empty() {
+            self.state = self
+                .state
+                .finish_trait(&mut self.document, !self.descriptions.is_empty())?;
+        }
+        self.state.check_indent(line)?;
+        if line.is_doc {
+            self.descriptions.push(line.text);
+        } else {
+            if !self.descriptions.is_empty()
+                && line.indent.is_empty()
+                && Section::from_header(line.text).is_some()
+            {
+                return Err(ParseError::unattached_description(line.number));
+            }
+            let entry = DescribedLine {
+                line,
+                description: self.descriptions.join("\n"),
+            };
+            self.descriptions.clear();
+            self.state = self.state.accept_entry(entry, &mut self.document)?;
+        }
+        Ok(self)
+    }
+
+    /// Finalize the last trait, check pending descriptions and required sections, then emit AST.
+    /// The iterator supplies the physical EOF line, including skipped trailing comments.
+    fn finish(mut self, eof_line: usize) -> Result<Document, ParseError> {
+        self.state = self
+            .state
+            .finish_trait(&mut self.document, !self.descriptions.is_empty())?;
+        if !self.descriptions.is_empty() {
+            return Err(ParseError::unattached_description(eof_line));
+        }
+        self.state.check_finished(eof_line)?;
+        Ok(self.document)
     }
 }
 
@@ -504,52 +698,38 @@ fn parse_definition(
     let mut cursor = 0;
     let name = take_qualified_name(&tokens, &mut cursor, line_no)?;
     let parameters = parse_optional_binders(&tokens, &mut cursor, line_no)?;
-    if cursor == tokens.len() {
-        if name.contains('.') {
-            return Err(ParseError::new(
-                line_no,
-                1,
-                "type names cannot be qualified",
-            ));
+    match tokens.get(cursor).map(|token| &token.kind) {
+        None | Some(TokenKind::Equal) => {
+            check_type_name(&name, line_no)?;
+            let body = if consume(&tokens, &mut cursor, TokenKind::Equal) {
+                Some(parse_type_until_end(&tokens[cursor..], line_no)?)
+            } else {
+                None
+            };
+            Ok(Definition::Type(TypeDecl {
+                name,
+                parameters,
+                body,
+                description,
+                line: line_no,
+            }))
         }
-        return Ok(Definition::Type(TypeDecl {
-            name,
-            parameters,
-            body: None,
-            description,
-            line: line_no,
-        }));
-    }
-    if consume(&tokens, &mut cursor, TokenKind::Equal) {
-        if name.contains('.') {
-            return Err(ParseError::new(
-                line_no,
-                1,
-                "type names cannot be qualified",
-            ));
+        _ => {
+            expect(&tokens, &mut cursor, TokenKind::Colon, line_no)?;
+            let arrow = find_top_level_arrow(&tokens, cursor)
+                .ok_or_else(|| ParseError::new(line_no, 1, "function signature is missing ->"))?;
+            let input = parse_type_until_end(&tokens[cursor..arrow], line_no)?;
+            let output = parse_type_until_end(&tokens[arrow + 1..], line_no)?;
+            Ok(Definition::Function(FunctionDecl {
+                name,
+                parameters,
+                input,
+                output,
+                description,
+                line: line_no,
+            }))
         }
-        let body = parse_type_until_end(&tokens[cursor..], line_no)?;
-        return Ok(Definition::Type(TypeDecl {
-            name,
-            parameters,
-            body: Some(body),
-            description,
-            line: line_no,
-        }));
     }
-    expect(&tokens, &mut cursor, TokenKind::Colon, line_no)?;
-    let arrow = find_top_level_arrow(&tokens, cursor)
-        .ok_or_else(|| ParseError::new(line_no, 1, "function signature is missing ->"))?;
-    let input = parse_type_until_end(&tokens[cursor..arrow], line_no)?;
-    let output = parse_type_until_end(&tokens[arrow + 1..], line_no)?;
-    Ok(Definition::Function(FunctionDecl {
-        name,
-        parameters,
-        input,
-        output,
-        description,
-        line: line_no,
-    }))
 }
 
 /// Parse a trait member signature, interpreting a bare output type as the field
@@ -683,13 +863,7 @@ fn parse_type_until_end(tokens: &[Token], line: usize) -> Result<TypeExpr, Parse
         line,
     };
     let ty = parser.parse_sum()?;
-    if parser.cursor != tokens.len() {
-        return Err(ParseError::new(
-            line,
-            tokens[parser.cursor].column,
-            "unexpected token after type expression",
-        ));
-    }
+    parser.expect_end()?;
     Ok(ty)
 }
 
@@ -723,28 +897,26 @@ impl TypeParser<'_> {
     /// An existential body consumes a full sum, giving its binder scope over all
     /// alternatives until the surrounding expression's delimiter.
     fn parse_primary(&mut self) -> Result<TypeExpr, ParseError> {
-        if self.peek_ident("exists") {
-            self.cursor += 1;
-            let name = self.take_name()?;
-            self.expect_ident("from")?;
-            let domain = self.parse_sum_until_colon()?;
-            self.expect(TokenKind::Colon)?;
-            let body = self.parse_sum()?;
-            return Ok(TypeExpr::Exists(
-                Box::new(Binder { name, domain }),
-                Box::new(body),
-            ));
-        }
         match self.peek_kind() {
+            Some(TokenKind::Ident(name)) if name == "exists" => self.parse_existential(),
             Some(TokenKind::LParen) => self.parse_product(),
             Some(TokenKind::Ident(_)) => self.parse_named(),
-            Some(_) => Err(ParseError::new(
-                self.line,
-                self.tokens[self.cursor].column,
-                "expected a type",
-            )),
-            None => Err(ParseError::new(self.line, 1, "expected a type")),
+            _ => Err(self.error("expected a type")),
         }
+    }
+
+    /// Parse an existential binder followed by the full sum expression in its scope.
+    fn parse_existential(&mut self) -> Result<TypeExpr, ParseError> {
+        self.cursor += 1;
+        let name = self.take_name()?;
+        self.expect_ident("from")?;
+        let domain = self.parse_sum_until_colon()?;
+        self.expect(TokenKind::Colon)?;
+        let body = self.parse_sum()?;
+        Ok(TypeExpr::Exists(
+            Box::new(Binder { name, domain }),
+            Box::new(body),
+        ))
     }
 
     /// Isolate an existential's domain at the first unnested colon, then parse
@@ -810,34 +982,29 @@ impl TypeParser<'_> {
     }
 
     fn take_name(&mut self) -> Result<String, ParseError> {
-        let token = self
-            .tokens
-            .get(self.cursor)
-            .ok_or_else(|| ParseError::new(self.line, 1, "expected identifier"))?;
-        if let TokenKind::Ident(name) = &token.kind {
-            reject_reserved(name, self.line, token.column)?;
-            self.cursor += 1;
-            Ok(name.clone())
-        } else {
-            Err(ParseError::new(
-                self.line,
-                token.column,
-                "expected identifier",
-            ))
-        }
+        take_ident(self.tokens, &mut self.cursor, self.line)
     }
 
     fn expect_ident(&mut self, expected: &str) -> Result<(), ParseError> {
-        if self.peek_ident(expected) {
-            self.cursor += 1;
-            Ok(())
-        } else {
-            Err(ParseError::new(
-                self.line,
-                self.tokens.get(self.cursor).map_or(1, |token| token.column),
-                format!("expected {expected}"),
-            ))
+        if !self.peek_ident(expected) {
+            return Err(self.error(format!("expected {expected}")));
         }
+        self.cursor += 1;
+        Ok(())
+    }
+
+    /// Construct a diagnostic at the current token, using column one at EOF.
+    fn error(&self, message: impl Into<String>) -> ParseError {
+        let column = self.tokens.get(self.cursor).map_or(1, |token| token.column);
+        ParseError::new(self.line, column, message)
+    }
+
+    /// Require the parsed type to consume its entire token slice.
+    fn expect_end(&self) -> Result<(), ParseError> {
+        if self.cursor != self.tokens.len() {
+            return Err(self.error("unexpected token after type expression"));
+        }
+        Ok(())
     }
 
     fn peek_ident(&self, expected: &str) -> bool {
@@ -858,15 +1025,10 @@ impl TypeParser<'_> {
     }
 
     fn expect(&mut self, kind: TokenKind) -> Result<(), ParseError> {
-        if self.consume(kind) {
-            Ok(())
-        } else {
-            Err(ParseError::new(
-                self.line,
-                self.tokens.get(self.cursor).map_or(1, |token| token.column),
-                "unexpected token",
-            ))
+        if !self.consume(kind) {
+            return Err(self.error("unexpected token"));
         }
+        Ok(())
     }
 }
 
@@ -874,13 +1036,12 @@ fn take_ident(tokens: &[Token], cursor: &mut usize, line: usize) -> Result<Strin
     let token = tokens
         .get(*cursor)
         .ok_or_else(|| ParseError::new(line, 1, "expected identifier"))?;
-    if let TokenKind::Ident(name) = &token.kind {
-        reject_reserved(name, line, token.column)?;
-        *cursor += 1;
-        Ok(name.clone())
-    } else {
-        Err(ParseError::new(line, token.column, "expected identifier"))
-    }
+    let TokenKind::Ident(name) = &token.kind else {
+        return Err(ParseError::new(line, token.column, "expected identifier"));
+    };
+    reject_reserved(name, line, token.column)?;
+    *cursor += 1;
+    Ok(name.clone())
 }
 
 fn take_qualified_name(
@@ -906,18 +1067,18 @@ fn expect_ident(
     expected: &str,
     line: usize,
 ) -> Result<(), ParseError> {
-    match tokens.get(*cursor).map(|token| &token.kind) {
-        Some(TokenKind::Ident(name)) if name == expected => {
-            *cursor += 1;
-            Ok(())
-        }
-        Some(token) => Err(ParseError::new(
+    let token = tokens
+        .get(*cursor)
+        .ok_or_else(|| ParseError::new(line, 1, format!("expected {expected}")))?;
+    if !matches!(&token.kind, TokenKind::Ident(name) if name == expected) {
+        return Err(ParseError::new(
             line,
-            tokens[*cursor].column,
-            format!("expected {expected}, found {token:?}"),
-        )),
-        None => Err(ParseError::new(line, 1, format!("expected {expected}"))),
+            token.column,
+            format!("expected {expected}, found {:?}", token.kind),
+        ));
     }
+    *cursor += 1;
+    Ok(())
 }
 
 fn expect(
@@ -926,19 +1087,18 @@ fn expect(
     expected: TokenKind,
     line: usize,
 ) -> Result<(), ParseError> {
-    if tokens
+    if !tokens
         .get(*cursor)
         .is_some_and(|token| token.kind == expected)
     {
-        *cursor += 1;
-        Ok(())
-    } else {
-        Err(ParseError::new(
+        return Err(ParseError::new(
             line,
             tokens.get(*cursor).map_or(1, |token| token.column),
             format!("expected {expected:?}"),
-        ))
+        ));
     }
+    *cursor += 1;
+    Ok(())
 }
 
 fn consume(tokens: &[Token], cursor: &mut usize, expected: TokenKind) -> bool {
@@ -954,15 +1114,14 @@ fn consume(tokens: &[Token], cursor: &mut usize, expected: TokenKind) -> bool {
 }
 
 fn ensure_end(tokens: &[Token], cursor: usize, line: usize) -> Result<(), ParseError> {
-    if cursor == tokens.len() {
-        Ok(())
-    } else {
-        Err(ParseError::new(
+    if cursor != tokens.len() {
+        return Err(ParseError::new(
             line,
             tokens[cursor].column,
             "unexpected trailing tokens",
-        ))
+        ));
     }
+    Ok(())
 }
 
 /// Tokenize one comment-free declaration using ASCII identifiers, punctuation,
@@ -1043,27 +1202,37 @@ fn tokenize(text: &str, line: usize) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
+/// Validate significant-line prefixes while ignoring blank lines and ordinary comments.
+fn check_indent_prefix(indent: &str, content: &str, line: usize) -> Result<(), ParseError> {
+    let is_ignored =
+        content.is_empty() || (content.starts_with("//") && !content.starts_with("///"));
+    if !is_ignored && indent.contains(' ') && indent.contains('\t') {
+        return Err(ParseError::new(
+            line,
+            1,
+            "do not mix spaces and tabs in indentation",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject qualified names for nominal type declarations.
+fn check_type_name(name: &str, line: usize) -> Result<(), ParseError> {
+    if name.contains('.') {
+        return Err(ParseError::new(line, 1, "type names cannot be qualified"));
+    }
+    Ok(())
+}
+
 fn reject_reserved(name: &str, line: usize, column: usize) -> Result<(), ParseError> {
     if matches!(name, "from" | "exists" | "DEFINITIONS" | "FEATURES") {
-        Err(ParseError::new(
+        return Err(ParseError::new(
             line,
             column,
             format!("'{name}' is a reserved word"),
-        ))
-    } else {
-        Ok(())
+        ));
     }
-}
-fn reject_pending_description(pending: &[&str], line: usize) -> Result<(), ParseError> {
-    if pending.is_empty() {
-        Ok(())
-    } else {
-        Err(ParseError::new(
-            line,
-            1,
-            "description is not attached to a declaration",
-        ))
-    }
+    Ok(())
 }
 
 #[cfg(test)]

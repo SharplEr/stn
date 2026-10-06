@@ -1,10 +1,50 @@
 //! Proof tests and independent witness translation, compiled only under `cfg(test)`.
 use super::{Proof, ProofId};
 use crate::{
-    Cost, FeatureStatus, ProofNode, ProofStore, Rule, TypeId, TypeStore, ValidationError,
+    Cost, FeatureStatus, ProofNode, ProofStore, Rule, Type, TypeId, TypeStore, ValidationError,
     ValidationOptions, model, syntax, validate_source,
 };
 use std::collections::{HashMap, HashSet};
+
+#[test]
+fn shared_proof_cost_overflow_is_reported_without_unfolding_the_dag() {
+    let mut report = validate_source(
+        "input",
+        "DEFINITIONS:\nFEATURES:\nsame: () -> ()\n".to_owned(),
+        &ValidationOptions::default(),
+    )
+    .unwrap();
+    let FeatureStatus::Proved { proofs } = &report.features[0].status else {
+        panic!("expected identity proof");
+    };
+    let mut root = proofs[0];
+    // Every level doubles the logical tree while adding only one stored proof.
+    // All nodes before the final level have representable, correct costs.
+    for _ in 0..usize::BITS {
+        let previous = &report.proofs[root];
+        let output = report.types.intern(Type::Product(vec![previous.output; 2]));
+        let proof = Proof {
+            input: previous.input,
+            output,
+            cost: Cost {
+                functions: 0,
+                rules: previous.cost.rules.saturating_mul(2).saturating_add(1),
+            },
+            node: ProofNode::Inference {
+                rule: Rule::Fanout,
+                children: vec![root; 2],
+            },
+        };
+        root = report.proofs.insert(proof);
+    }
+    assert_eq!(
+        report
+            .proofs
+            .check_against(root, &[], &report.types)
+            .unwrap_err(),
+        "proof cost overflow",
+    );
+}
 
 impl ProofStore {
     /// Number of proof records owned by the store.
@@ -23,7 +63,7 @@ impl ProofStore {
         source: String,
         types: &TypeStore,
     ) -> Result<(), ValidationError> {
-        let document = syntax::SourceText::new(source)?.parse()?;
+        let document = syntax::SourceText::new(source).parse()?;
         let mut specification = model::elaborate(&document)?;
         let mut imported = Self::default();
         let root = imported

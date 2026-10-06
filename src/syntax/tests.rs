@@ -1,5 +1,5 @@
 //! Parser tests and source inspection helpers, compiled only under `cfg(test)`.
-use super::{Document, ParseError, SourceLine, SourceText, TypeExpr};
+use super::{Document, ParseError, SourceText, TypeExpr};
 use crate::{ValidationOptions, validate_source};
 
 impl SourceText {
@@ -7,18 +7,12 @@ impl SourceText {
     fn as_str(&self) -> &str {
         &self.text
     }
-
-    /// Iterate borrowed line views in their original physical order.
-    fn lines(&self) -> impl ExactSizeIterator<Item = SourceLine<'_>> + DoubleEndedIterator {
-        (0..self.line_count())
-            .map(|index| self.line(index).expect("index is within the line count"))
-    }
 }
 
-/// Parse an owned source buffer through the range-based source-line index.
-/// Construct `SourceText` explicitly to retain its line views or parse repeatedly.
+/// Parse an owned source buffer through lazy line preprocessing and the document automaton.
+/// Construct `SourceText` explicitly to iterate its line views or parse repeatedly.
 fn parse(source: String) -> Result<Document, ParseError> {
-    SourceText::new(source)?.parse()
+    SourceText::new(source).parse()
 }
 
 #[test]
@@ -26,14 +20,12 @@ fn line_views_borrow_owned_unicode_text_and_preserve_crlf_positions() {
     let text = "DEFINITIONS:\r\n///  Документ  \r\nReader: // inline\r\n\tvalue: String\r\nFEATURES:\r\nf: Reader -> String\r\n";
     let text = text.to_owned();
     let original_buffer = text.as_ptr();
-    let source = SourceText::new(text).unwrap();
+    let source = SourceText::new(text);
     let text = source.as_str();
     assert_eq!(source.as_str().as_ptr(), original_buffer);
-    assert_eq!(source.line_count(), text.lines().count());
-    assert_eq!(source.lines().len(), 6);
-    assert!(source.line(6).is_none());
-
-    let doc = source.line(1).unwrap();
+    let mut lines = source.lines();
+    assert_eq!(lines.next().unwrap().unwrap().text, "DEFINITIONS:");
+    let doc = lines.next().unwrap().unwrap();
     assert_eq!(doc.number, 2);
     assert_eq!(doc.text, "Документ");
     assert!(doc.is_doc);
@@ -41,15 +33,19 @@ fn line_views_borrow_owned_unicode_text_and_preserve_crlf_positions() {
         doc.text.as_ptr(),
         text[text.find("Документ").unwrap()..].as_ptr()
     );
-
-    let member = source.line(3).unwrap();
+    assert_eq!(lines.next().unwrap().unwrap().text, "Reader:");
+    let member = lines.next().unwrap().unwrap();
+    assert_eq!(member.number, 4);
     assert_eq!(member.indent, "\t");
     assert_eq!(member.text, "value: String");
     assert_eq!(
         member.indent.as_ptr(),
         text[text.find("\tvalue").unwrap()..].as_ptr()
     );
-    assert_eq!(source.line(2).unwrap().text, "Reader:");
+    assert_eq!(lines.next().unwrap().unwrap().text, "FEATURES:");
+    assert_eq!(lines.next().unwrap().unwrap().text, "f: Reader -> String");
+    assert!(lines.next().is_none());
+    assert_eq!(lines.eof_line(), 6);
     let document = source.parse().unwrap();
     assert_eq!(document.traits[0].members[0].line, 4);
     assert_eq!(document.types.len(), 0);
@@ -60,12 +56,12 @@ fn line_views_borrow_owned_unicode_text_and_preserve_crlf_positions() {
 fn owned_source_moves_without_copying_the_buffer_and_ast_outlives_it() {
     let text = String::from("DEFINITIONS:\n/// first\n///\n/// last\nA\nFEATURES:\nsame: A -> A\n");
     let original_buffer = text.as_ptr();
-    let source = SourceText::new(text).unwrap();
+    let source = SourceText::new(text);
     let mut sources = Vec::new();
     sources.push(source);
     let source = sources.pop().unwrap();
     assert_eq!(source.as_str().as_ptr(), original_buffer);
-    assert_eq!(source.line(4).unwrap().text, "A");
+    assert_eq!(source.lines().nth(4).unwrap().unwrap().text, "A");
     let document = source.parse().unwrap();
     drop(source);
     assert_eq!(document.types[0].description, "first\n\nlast");
@@ -73,7 +69,7 @@ fn owned_source_moves_without_copying_the_buffer_and_ast_outlives_it() {
 }
 
 #[test]
-fn indexed_sources_follow_physical_line_conventions_at_boundaries() {
+fn lazy_sources_follow_physical_line_conventions_at_boundaries() {
     for text in [
         "",
         "\n",
@@ -84,13 +80,68 @@ fn indexed_sources_follow_physical_line_conventions_at_boundaries() {
         "\n\n",
         "A\r",
     ] {
-        let source = SourceText::new(text.to_owned()).unwrap();
-        assert_eq!(source.line_count(), text.lines().count(), "{text:?}");
-        for line in source.lines() {
-            assert!(line.number <= source.line_count());
+        let source = SourceText::new(text.to_owned());
+        let mut lines = source.lines();
+        for line in &mut lines {
+            let line = line.unwrap();
+            assert!(line.number <= text.lines().count());
             assert!(line.text.is_empty() || line.text == "A");
         }
+        assert_eq!(lines.eof_line(), text.lines().count().max(1), "{text:?}");
+        assert!(lines.next().is_none());
     }
+}
+
+#[test]
+fn line_iterator_filters_lazily_and_retains_physical_positions() {
+    let source =
+        SourceText::new("DEFINITIONS:\n \t// ignored\n\n///\nA\n \tBad\n// trailing\n".to_owned());
+    let mut lines = source.lines();
+    assert_eq!(lines.eof_line(), 1);
+    assert_eq!(lines.next().unwrap().unwrap().number, 1);
+    let description = lines.next().unwrap().unwrap();
+    assert_eq!(description.number, 4);
+    assert!(description.is_doc);
+    assert!(description.text.is_empty());
+    assert_eq!(lines.eof_line(), 4);
+    assert_eq!(lines.next().unwrap().unwrap().text, "A");
+    let error = lines.next().unwrap().unwrap_err();
+    assert_eq!((error.line, error.column), (6, 1));
+    assert_eq!(error.message, "do not mix spaces and tabs in indentation");
+    assert!(lines.next().is_none());
+    assert_eq!(lines.eof_line(), 7);
+    assert!(lines.next().is_none());
+}
+
+#[test]
+fn parsing_stops_before_a_later_line_preprocessing_error() {
+    let error = parse("A\n \tBad\n".to_owned()).unwrap_err();
+    assert_eq!((error.line, error.column), (1, 1));
+    assert_eq!(error.message, "expected DEFINITIONS: section");
+}
+
+#[test]
+fn dedent_finishes_each_trait_and_accepts_the_same_line_in_definitions() {
+    let ast = parse(
+        concat!(
+            "DEFINITIONS:\nA\n",
+            "/// Reader contract\nReader:\n",
+            "   /// Member contract\n// ignored without dedenting\n   value: A\n",
+            "/// Writer contract\nWriter:\n  append: A -> ()\n",
+            "FEATURES:\n/// Goal contract\nf: Reader -> A\n",
+        )
+        .to_owned(),
+    )
+    .unwrap();
+    assert_eq!(ast.traits.len(), 2);
+    assert_eq!(ast.traits[0].name, "Reader");
+    assert_eq!(ast.traits[0].description, "Reader contract");
+    assert_eq!(ast.traits[0].members[0].description, "Member contract");
+    assert_eq!(ast.traits[1].name, "Writer");
+    assert_eq!(ast.traits[1].description, "Writer contract");
+    assert_eq!(ast.traits[1].members[0].name, "append");
+    assert_eq!(ast.features.len(), 1);
+    assert_eq!(ast.features[0].description, "Goal contract");
 }
 
 #[test]
@@ -163,4 +214,131 @@ fn indentation_on_ordinary_comments_is_ignored_and_empty_description_lines_survi
     )
     .unwrap();
     assert_eq!(ast.types[0].description, "first\n\nlast");
+}
+
+#[test]
+fn descriptions_stay_with_their_declarations_across_block_boundaries() {
+    let ast = parse(
+        concat!(
+            "DEFINITIONS:\n",
+            "/// Receiver\nReader:\n",
+            "    /// First\n    // ignored\n\n    first: String\n",
+            "    /// Second\n    second: String\n",
+            "// ignored\n/// Value type\nValue\n",
+            "FEATURES:\n/// Goal\nf: Reader -> String\n",
+        )
+        .to_owned(),
+    )
+    .unwrap();
+    assert_eq!(ast.traits[0].description, "Receiver");
+    assert_eq!(ast.traits[0].members.len(), 2);
+    assert_eq!(ast.traits[0].members[0].description, "First");
+    assert_eq!(ast.traits[0].members[1].description, "Second");
+    assert_eq!(ast.types[0].name, "Value");
+    assert_eq!(ast.types[0].description, "Value type");
+    assert_eq!(ast.features[0].description, "Goal");
+}
+
+#[test]
+fn section_and_trait_boundaries_report_their_source_positions() {
+    for (source, line, column, message) in [
+        ("", 1, 1, "missing DEFINITIONS: section"),
+        ("A\n", 1, 1, "expected DEFINITIONS: section"),
+        ("FEATURES:\n", 1, 1, "section is duplicated or out of order"),
+        (
+            "DEFINITIONS:\nDEFINITIONS:\nFEATURES:\n",
+            2,
+            1,
+            "section is duplicated or out of order",
+        ),
+        (
+            "DEFINITIONS:\nFEATURES:\nFEATURES:\n",
+            3,
+            1,
+            "section is duplicated or out of order",
+        ),
+        ("DEFINITIONS:\nA\n", 2, 1, "missing FEATURES: section"),
+        (
+            "DEFINITIONS:\nA\n// trailing comment\n\n",
+            4,
+            1,
+            "missing FEATURES: section",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n",
+            2,
+            1,
+            "a trait must contain at least one member",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n    value: String\n// trailing\n",
+            4,
+            1,
+            "missing FEATURES: section",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n    /// orphan\n",
+            2,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "/// orphan\n// trailing\n\n",
+            3,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "DEFINITIONS:\n/// orphan\n// trailing\n",
+            3,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "DEFINITIONS:\nFEATURES:\n/// orphan\n// trailing\n\n",
+            5,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "DEFINITIONS:\nReader:\nFEATURES:\n",
+            2,
+            1,
+            "a trait must contain at least one member",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n    value: String\n    /// orphan\nA\nFEATURES:\n",
+            2,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n    value: String\n  /// wrong indent\nFEATURES:\n",
+            4,
+            1,
+            "trait members must use consistent indentation",
+        ),
+        (
+            "DEFINITIONS:\nReader:\n    value: @\nFEATURES:\n",
+            3,
+            12,
+            "unexpected character '@'",
+        ),
+        (
+            "DEFINITIONS:\n/// orphan\nFEATURES:\n",
+            3,
+            1,
+            "description is not attached to a declaration",
+        ),
+        (
+            "DEFINITIONS:\nFEATURES:\n/// orphan\n",
+            3,
+            1,
+            "description is not attached to a declaration",
+        ),
+    ] {
+        let error = parse(source.to_owned()).unwrap_err();
+        assert_eq!((error.line, error.column), (line, column), "{source:?}");
+        assert_eq!(error.message, message, "{source:?}");
+    }
 }

@@ -1,5 +1,87 @@
 use std::num::NonZeroUsize;
-use stn_validator::{Cost, FeatureStatus, ValidationOptions, ValidationReport, validate_source};
+use stn_validator::{
+    Cost, FeatureStatus, ValidationError, ValidationOptions, ValidationReport, validate_source,
+};
+
+#[test]
+fn declaration_failures_preserve_diagnostics_and_validation_order() {
+    for (source, message) in [
+        (
+            "DEFINITIONS:\nString\nFEATURES:\n",
+            "line 2: built-in type 'String' cannot be redeclared",
+        ),
+        (
+            "DEFINITIONS:\nBad = Unknown\nA\nA\nFEATURES:\n",
+            "line 4: duplicate type declaration 'A'",
+        ),
+        (
+            "DEFINITIONS:\nA\nA:\n    value: String\nFEATURES:\n",
+            "line 3: duplicate or reserved type 'A'",
+        ),
+        (
+            "DEFINITIONS:\nA = Unknown\nFEATURES:\n",
+            "line 2: unknown type 'Unknown'",
+        ),
+        (
+            "DEFINITIONS:\nA\nF<T from A>\nBad = F<A, A>\nFEATURES:\n",
+            "line 4: type 'F' expects 1 argument(s), got 2",
+        ),
+        (
+            "DEFINITIONS:\nA\nB\nS = A\nF<T from S>\nBad = F<B>\nFEATURES:\n",
+            "line 6: type argument B is outside the domain of F<T>",
+        ),
+        (
+            "DEFINITIONS:\nA\nF<T from A> = List<T<A>>\nFEATURES:\n",
+            "line 3: type parameter 'T' cannot have arguments",
+        ),
+        (
+            "DEFINITIONS:\nA = String<Byte>\nFEATURES:\n",
+            "line 2: built-in type String does not take arguments",
+        ),
+        (
+            "DEFINITIONS:\nA = Map<String>\nFEATURES:\n",
+            "line 2: wrong arity for Map",
+        ),
+        (
+            "DEFINITIONS:\nA\nF<T from A> = exists T from A: T\nFEATURES:\n",
+            "line 3: existential binder shadows an outer parameter",
+        ),
+        (
+            "DEFINITIONS:\nA\nF<T from A, T from A>\nFEATURES:\n",
+            "line 3: type parameter 'T' is duplicated or shadows an outer parameter",
+        ),
+        (
+            "DEFINITIONS:\nA\nFEATURES:\nf: A -> A\nf: A -> A\n",
+            "line 5: duplicate feature 'f'",
+        ),
+        (
+            "DEFINITIONS:\nA\nFEATURES:\nf: A -> Unknown\nf: A -> A\n",
+            "line 4: unknown type 'Unknown'",
+        ),
+    ] {
+        let error =
+            validate_source("input", source.to_owned(), &ValidationOptions::default()).unwrap_err();
+        let ValidationError::Invalid(actual) = error else {
+            panic!("expected a declaration diagnostic, got {error:?}");
+        };
+        assert_eq!(actual, message, "{source:?}");
+    }
+}
+
+#[test]
+fn specialization_limit_is_checked_before_resolving_the_body() {
+    let variants = (0..101).map(|i| format!("A{i}")).collect::<Vec<_>>();
+    let source = format!(
+        "DEFINITIONS:\n{}\nKinds = {}\nF<T from Kinds, U from Kinds, V from Kinds> = Unknown\nFEATURES:\n",
+        variants.join("\n"),
+        variants.join(" | "),
+    );
+    let error = validate_source("input", source, &ValidationOptions::default()).unwrap_err();
+    assert!(matches!(error, ValidationError::ExpansionLimit {
+        line: 104,
+        limit: 100_000
+    },));
+}
 
 fn validate(defs: &str, goals: &str) -> ValidationReport {
     validate_source(

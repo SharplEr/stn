@@ -139,16 +139,30 @@ with their unit tests in `src/proof/tests.rs`, compiled only with `#[cfg(test)]`
 These tests translate identifiers into independent stores and deliberately edit
 witnesses to check that invalid evidence is rejected.
 
-`syntax::SourceText` stores one source buffer and byte ranges for physical lines.
-It takes ownership of the input `String` without copying its buffer.
-`line(index)` returns a `SourceLine` view with borrowed indentation and text
-slices. The CLI transfers its input buffer to `validate_source`, whose
-preprocessing and parsing use these views. AST names and joined descriptions are
-owned independently, so parsed documents can outlive the source buffer.
-`validate_source` and `SourceText::new` consume a `String`; callers transfer their
-input buffer into this pipeline. `SourceText` has no source lifetime parameter.
-Source inspection helpers `as_str` and `lines`, and the shorthand parser used by
-tests, live in `src/syntax/tests.rs` and are absent from the public API.
+`syntax::SourceText` takes ownership of one `String` without copying or scanning
+its buffer; its constructor is infallible. `lines()` creates a lazy `SourceLines`
+iterator with items of type `Result<SourceLine, ParseError>`. It skips ordinary
+comments and blank lines, retains semantic descriptions, and returns borrowed
+text and indentation slices with their original physical line numbers. The
+iterator records skipped trailing lines too, so EOF diagnostics retain their
+source positions. There is no line index or intermediate collection of lines.
+
+`SourceText::parse` feeds this iterator into `DocumentParser` with a `for` loop.
+Its automaton states are `ExpectDefinitions`, `Definitions`, `Trait`, and
+`Features`. Trait state owns a `TraitBuilder`; on dedent it emits the completed
+trait before the same line is accepted in Definitions state. `finish` closes an
+active trait and checks pending descriptions and required sections at EOF.
+Both preprocessing and parsing fail in source order, without scanning later
+lines after an earlier error. Description slices are joined once when attached
+to a declaration; the completed AST owns its strings and can outlive the buffer.
+
+The CLI transfers its input buffer to `validate_source`. `SourceText` has no
+source lifetime parameter. The source inspection helper `as_str` and the shorthand
+parser used by tests live in `src/syntax/tests.rs` and are absent from the public
+API. Elaboration remains a sequence of registration, cycle and body validation,
+morphism and feature expansion, and overload checks. Proof traversal separates
+endpoint checks, node contracts, and cost calculation; search handles interruptions
+outside its successful result processing.
 
 Both stores use `indexmap::IndexSet` to combine hash lookup with access by index,
 keeping each node in a single collection. Inserting an equal node reuses its

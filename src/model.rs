@@ -7,6 +7,9 @@ use std::{
     ops::Index,
 };
 
+/// Maximum ground substitutions produced by one finite parameter list.
+const SPECIALIZATION_LIMIT: usize = 100_000;
+
 /// Index of an immutable type node in its owning `TypeStore`.
 /// Identifiers can be copied cheaply, but are meaningful only within that store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -335,7 +338,39 @@ impl TypeStore {
             }
         }
         let info = self.declarations.get(name).cloned();
-        if let Some(info) = &info {
+        self.check_nominal_arguments(name, &args, info.as_ref(), line)?;
+        let id = self.intern(node);
+        let shape = if name == "Bytes" {
+            let byte = self.intern(Type::Named("Byte".to_owned(), Vec::new()));
+            self.intern(Type::List(byte))
+        } else if let Some(TypeInfo {
+            parameters,
+            body: Some(body),
+        }) = info
+        {
+            let env = parameters
+                .iter()
+                .zip(args)
+                .map(|(b, a)| (b.name.clone(), a))
+                .collect();
+            self.resolve(&body, &env, line)?
+        } else {
+            id
+        };
+        self.shapes.insert(id, shape);
+        Ok(id)
+    }
+
+    /// Validate a nominal application's name, arity, and finite argument domains.
+    /// This check runs before the node or its directed structural view is stored.
+    fn check_nominal_arguments(
+        &mut self,
+        name: &str,
+        args: &[TypeId],
+        info: Option<&TypeInfo>,
+        line: usize,
+    ) -> Result<(), ValidationError> {
+        if let Some(info) = info {
             if info.parameters.len() != args.len() {
                 return Err(invalid(
                     line,
@@ -346,7 +381,7 @@ impl TypeStore {
                     ),
                 ));
             }
-            for (binder, arg) in info.parameters.iter().zip(&args) {
+            for (binder, arg) in info.parameters.iter().zip(args) {
                 let domain = self.resolve(&binder.domain, &BTreeMap::new(), line)?;
                 let permitted = self.outer_variants(domain);
                 let valid = match &self[*arg] {
@@ -372,26 +407,7 @@ impl TypeStore {
                 format!("built-in type {name} does not take arguments"),
             ));
         }
-        let id = self.intern(node);
-        let shape = if name == "Bytes" {
-            let byte = self.intern(Type::Named("Byte".to_owned(), Vec::new()));
-            self.intern(Type::List(byte))
-        } else if let Some(TypeInfo {
-            parameters,
-            body: Some(body),
-        }) = info
-        {
-            let env = parameters
-                .iter()
-                .zip(args)
-                .map(|(b, a)| (b.name.clone(), a))
-                .collect();
-            self.resolve(&body, &env, line)?
-        } else {
-            id
-        };
-        self.shapes.insert(id, shape);
-        Ok(id)
+        Ok(())
     }
 
     /// Resolve syntax into this store using the supplied parameter substitutions.
@@ -404,69 +420,106 @@ impl TypeStore {
         env: &BTreeMap<String, TypeId>,
         line: usize,
     ) -> Result<TypeId, ValidationError> {
-        let node = match expr {
-            syntax::TypeExpr::Name(name, args) => {
-                if let Some(&value) = env.get(name) {
-                    if !args.is_empty() {
-                        return Err(invalid(
-                            line,
-                            format!("type parameter '{name}' cannot have arguments"),
-                        ));
-                    }
-                    return Ok(value);
-                }
-                let args = args
-                    .iter()
-                    .map(|arg| self.resolve(arg, env, line))
-                    .collect::<Result<Vec<_>, _>>()?;
-                match (name.as_str(), args.as_slice()) {
-                    ("List", [item]) => Type::List(*item),
-                    ("Set", [item]) => Type::Set(*item),
-                    ("Map", [key, value]) => Type::Map(*key, *value),
-                    ("List" | "Set" | "Map", _) => {
-                        return Err(invalid(line, format!("wrong arity for {name}")));
-                    }
-                    _ => return self.nominal(name, args, line),
-                }
+        match expr {
+            syntax::TypeExpr::Name(name, args) => self.resolve_name(name, args, env, line),
+            syntax::TypeExpr::Sum(items) => {
+                let items = self.resolve_components(items, env, line)?;
+                Ok(self.intern(Type::Sum(items)))
             }
-            syntax::TypeExpr::Sum(items) => Type::Sum(
-                items
-                    .iter()
-                    .map(|item| self.resolve(item, env, line))
-                    .collect::<Result<_, _>>()?,
-            ),
-            syntax::TypeExpr::Product(items) => Type::Product(
-                items
-                    .iter()
-                    .map(|item| self.resolve(item, env, line))
-                    .collect::<Result<_, _>>()?,
-            ),
+            syntax::TypeExpr::Product(items) => {
+                let items = self.resolve_components(items, env, line)?;
+                Ok(self.intern(Type::Product(items)))
+            }
             syntax::TypeExpr::Exists(binder, body) => {
-                let domain = self.resolve(&binder.domain, &BTreeMap::new(), line)?;
-                let variants = self.outer_variants(domain);
-                if variants.is_empty() {
-                    return Err(invalid(line, "existential domain is empty"));
-                }
-                if env.contains_key(&binder.name) {
-                    return Err(invalid(
-                        line,
-                        "existential binder shadows an outer parameter",
-                    ));
-                }
-                let canonical = format!(
-                    "T{}",
-                    env.values()
-                        .filter(|t| matches!(self[**t], Type::Var(..)))
-                        .count()
-                );
-                let variable = self.intern(Type::Var(canonical.clone(), variants));
-                let mut nested = env.clone();
-                nested.insert(binder.name.clone(), variable);
-                let body = self.resolve(body, &nested, line)?;
-                Type::Exists(canonical, domain, body)
+                self.resolve_existential(binder, body, env, line)
             }
-        };
-        Ok(self.intern(node))
+        }
+    }
+
+    /// Resolve ordered child expressions without changing their surrounding constructor.
+    fn resolve_components(
+        &mut self,
+        items: &[syntax::TypeExpr],
+        env: &BTreeMap<String, TypeId>,
+        line: usize,
+    ) -> Result<Vec<TypeId>, ValidationError> {
+        items
+            .iter()
+            .map(|item| self.resolve(item, env, line))
+            .collect()
+    }
+
+    /// Resolve a scoped parameter or a nominal/collection application.
+    /// Parameter references are checked before resolving constructor arguments.
+    fn resolve_name(
+        &mut self,
+        name: &str,
+        args: &[syntax::TypeExpr],
+        env: &BTreeMap<String, TypeId>,
+        line: usize,
+    ) -> Result<TypeId, ValidationError> {
+        match env.get(name) {
+            Some(&value) => {
+                check_parameter_reference(name, args, line)?;
+                Ok(value)
+            }
+            None => {
+                let args = self.resolve_components(args, env, line)?;
+                match (name, args.as_slice()) {
+                    ("List", [item]) => Ok(self.intern(Type::List(*item))),
+                    ("Set", [item]) => Ok(self.intern(Type::Set(*item))),
+                    ("Map", [key, value]) => Ok(self.intern(Type::Map(*key, *value))),
+                    ("List" | "Set" | "Map", _) => {
+                        Err(invalid(line, format!("wrong arity for {name}")))
+                    }
+                    _ => self.nominal(name, args, line),
+                }
+            }
+        }
+    }
+
+    /// Resolve and canonicalize a package after checking its finite domain and scope.
+    fn resolve_existential(
+        &mut self,
+        binder: &syntax::Binder,
+        body: &syntax::TypeExpr,
+        env: &BTreeMap<String, TypeId>,
+        line: usize,
+    ) -> Result<TypeId, ValidationError> {
+        let domain = self.resolve(&binder.domain, &BTreeMap::new(), line)?;
+        let variants = self.outer_variants(domain);
+        self.check_existential_scope(binder, &variants, env, line)?;
+        let canonical = format!(
+            "T{}",
+            env.values()
+                .filter(|t| matches!(self[**t], Type::Var(..)))
+                .count()
+        );
+        let variable = self.intern(Type::Var(canonical.clone(), variants));
+        let mut nested = env.clone();
+        nested.insert(binder.name.clone(), variable);
+        let body = self.resolve(body, &nested, line)?;
+        Ok(self.intern(Type::Exists(canonical, domain, body)))
+    }
+
+    /// Reject an empty existential domain or a binder shadowing an outer parameter.
+    fn check_existential_scope(
+        &self,
+        binder: &syntax::Binder,
+        variants: &[TypeId],
+        env: &BTreeMap<String, TypeId>,
+        line: usize,
+    ) -> Result<(), ValidationError> {
+        if variants.is_empty() {
+            return Err(invalid(line, "existential domain is empty"));
+        }
+        if env.contains_key(&binder.name) {
+            return Err(invalid(
+                line,
+                "existential binder shadows an outer parameter",
+            ));
+        }
+        Ok(())
     }
 
     /// Expand closed finite parameter domains into every concrete substitution.
@@ -494,40 +547,55 @@ impl TypeStore {
         let mut envs = vec![parent.clone()];
         let mut names = HashSet::new();
         for binder in parameters {
-            if !names.insert(binder.name.clone()) || parent.contains_key(&binder.name) {
-                return Err(invalid(
+            let variants = self.parameter_variants(binder, parent, &mut names, line)?;
+            let capacity = envs
+                .len()
+                .checked_mul(variants.len())
+                .filter(|&size| size <= SPECIALIZATION_LIMIT)
+                .ok_or(ValidationError::ExpansionLimit {
                     line,
-                    format!(
-                        "type parameter '{}' is duplicated or shadows an outer parameter",
-                        binder.name
-                    ),
-                ));
-            }
-            let domain = self.resolve(&binder.domain, &BTreeMap::new(), line)?;
-            let variants = self.outer_variants(domain);
-            if variants.is_empty() {
-                return Err(invalid(
-                    line,
-                    format!("type parameter '{}' has an empty domain", binder.name),
-                ));
-            }
-            let mut next = Vec::new();
+                    limit: SPECIALIZATION_LIMIT,
+                })?;
+            let mut next = Vec::with_capacity(capacity);
             for env in &envs {
                 for &variant in &variants {
                     let mut extended = env.clone();
                     extended.insert(binder.name.clone(), variant);
-                    if next.len() >= 100_000 {
-                        return Err(ValidationError::ExpansionLimit {
-                            line,
-                            limit: 100_000,
-                        });
-                    }
                     next.push(extended);
                 }
             }
             envs = next;
         }
         Ok(envs)
+    }
+
+    /// Validate one binder's name and closed domain before expanding environments.
+    /// Checking in declaration order preserves which invalid binder is reported first.
+    fn parameter_variants(
+        &mut self,
+        binder: &syntax::Binder,
+        parent: &BTreeMap<String, TypeId>,
+        names: &mut HashSet<String>,
+        line: usize,
+    ) -> Result<Vec<TypeId>, ValidationError> {
+        if !names.insert(binder.name.clone()) || parent.contains_key(&binder.name) {
+            return Err(invalid(
+                line,
+                format!(
+                    "type parameter '{}' is duplicated or shadows an outer parameter",
+                    binder.name
+                ),
+            ));
+        }
+        let domain = self.resolve(&binder.domain, &BTreeMap::new(), line)?;
+        let variants = self.outer_variants(domain);
+        if variants.is_empty() {
+            return Err(invalid(
+                line,
+                format!("type parameter '{}' has an empty domain", binder.name),
+            ));
+        }
+        Ok(variants)
     }
 
     /// Expand a function or feature into ground signatures using its finite parameters.
@@ -550,6 +618,143 @@ impl TypeStore {
                 })
             })
             .collect()
+    }
+
+    /// Check and register type and trait names before resolving any declaration body.
+    /// Preserve declaration order and category-specific duplicate diagnostics.
+    fn register_declarations(
+        &mut self,
+        document: &syntax::Document,
+    ) -> Result<(), ValidationError> {
+        let builtins = builtin_names();
+        for declaration in &document.types {
+            if builtins.contains(declaration.name.as_str()) {
+                return Err(invalid(
+                    declaration.line,
+                    format!("built-in type '{}' cannot be redeclared", declaration.name),
+                ));
+            }
+            if self.declarations.contains_key(&declaration.name) {
+                return Err(invalid(
+                    declaration.line,
+                    format!("duplicate type declaration '{}'", declaration.name),
+                ));
+            }
+            self.declarations
+                .insert(declaration.name.clone(), TypeInfo {
+                    parameters: declaration.parameters.clone(),
+                    body: declaration.body.clone(),
+                });
+        }
+        for declaration in &document.traits {
+            if builtins.contains(declaration.name.as_str())
+                || self.declarations.contains_key(&declaration.name)
+            {
+                return Err(invalid(
+                    declaration.line,
+                    format!("duplicate or reserved type '{}'", declaration.name),
+                ));
+            }
+            self.declarations
+                .insert(declaration.name.clone(), TypeInfo {
+                    parameters: declaration.parameters.clone(),
+                    body: None,
+                });
+        }
+        Ok(())
+    }
+
+    /// Validate even unused declarations and derive the explicit tuple-width bound.
+    fn validate_declarations(
+        &mut self,
+        document: &syntax::Document,
+    ) -> Result<usize, ValidationError> {
+        let mut tuple_arity = 2;
+        for declaration in &document.types {
+            for env in self.parameter_environments(&declaration.parameters, declaration.line)? {
+                for &value in env.values() {
+                    tuple_arity = tuple_arity.max(self.max_tuple_arity(value));
+                }
+                if let Some(body) = &declaration.body {
+                    let body = self.resolve(body, &env, declaration.line)?;
+                    tuple_arity = tuple_arity.max(self.max_tuple_arity(body));
+                }
+            }
+        }
+        for declaration in &document.traits {
+            self.parameter_environments(&declaration.parameters, declaration.line)?;
+        }
+        Ok(tuple_arity)
+    }
+
+    /// Expand standalone morphisms and lower trait members by inserting their receiver.
+    fn expand_primitives(
+        &mut self,
+        document: &syntax::Document,
+    ) -> Result<Vec<Primitive>, ValidationError> {
+        let mut primitives = Vec::new();
+        for function in &document.functions {
+            primitives.extend(self.expand_function(function)?);
+        }
+        for declaration in &document.traits {
+            for trait_env in
+                self.parameter_environments(&declaration.parameters, declaration.line)?
+            {
+                let args = declaration
+                    .parameters
+                    .iter()
+                    .map(|b| trait_env[&b.name])
+                    .collect();
+                let receiver = self.nominal(&declaration.name, args, declaration.line)?;
+                for member in &declaration.members {
+                    for env in self.parameter_environments_with_parent(
+                        &member.parameters,
+                        &trait_env,
+                        member.line,
+                    )? {
+                        let member_input = self.resolve(&member.input, &env, member.line)?;
+                        let output = self.resolve(&member.output, &env, member.line)?;
+                        let input = match &self[member_input] {
+                            Type::Unit => receiver,
+                            Type::Product(items) => {
+                                let mut tuple = vec![receiver];
+                                tuple.extend_from_slice(items);
+                                self.intern(Type::Product(tuple))
+                            }
+                            _ => self.intern(Type::Product(vec![receiver, member_input])),
+                        };
+                        primitives.push(Primitive {
+                            name: format!("{}.{}", declaration.name, member.name),
+                            input,
+                            output,
+                            line: member.line,
+                            description: member.description.clone(),
+                            substitutions: env,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(primitives)
+    }
+
+    /// Check feature names and expand each signature without adding it as a primitive.
+    fn expand_features(
+        &mut self,
+        declarations: &[syntax::FeatureDecl],
+    ) -> Result<Vec<Primitive>, ValidationError> {
+        let mut names = HashSet::new();
+        let mut features = Vec::new();
+        for feature in declarations {
+            if !names.insert(&feature.name) {
+                return Err(invalid(
+                    feature.line,
+                    format!("duplicate feature '{}'", feature.name),
+                ));
+            }
+            features.extend(self.expand_function(feature)?);
+        }
+        Ok(features)
     }
 
     /// Collect declared ground families and their shapes, stopping at the type limit.
@@ -700,112 +905,12 @@ pub(crate) struct Specification {
 /// Finally check overload intersections and infer the explicit tuple-width bound.
 /// Feature signatures remain separate goals and never become available morphisms.
 pub(crate) fn elaborate(document: &syntax::Document) -> Result<Specification, ValidationError> {
-    let builtins = builtin_names();
     let mut types = TypeStore::default();
-    for declaration in &document.types {
-        if builtins.contains(declaration.name.as_str()) {
-            return Err(invalid(
-                declaration.line,
-                format!("built-in type '{}' cannot be redeclared", declaration.name),
-            ));
-        }
-        if types.declarations.contains_key(&declaration.name) {
-            return Err(invalid(
-                declaration.line,
-                format!("duplicate type declaration '{}'", declaration.name),
-            ));
-        }
-        types
-            .declarations
-            .insert(declaration.name.clone(), TypeInfo {
-                parameters: declaration.parameters.clone(),
-                body: declaration.body.clone(),
-            });
-    }
-    for declaration in &document.traits {
-        if builtins.contains(declaration.name.as_str())
-            || types.declarations.contains_key(&declaration.name)
-        {
-            return Err(invalid(
-                declaration.line,
-                format!("duplicate or reserved type '{}'", declaration.name),
-            ));
-        }
-        types
-            .declarations
-            .insert(declaration.name.clone(), TypeInfo {
-                parameters: declaration.parameters.clone(),
-                body: None,
-            });
-    }
+    types.register_declarations(document)?;
     check_definition_cycles(document)?;
-    let mut tuple_arity = 2;
-    for declaration in &document.types {
-        for env in types.parameter_environments(&declaration.parameters, declaration.line)? {
-            for &value in env.values() {
-                tuple_arity = tuple_arity.max(types.max_tuple_arity(value));
-            }
-            if let Some(body) = &declaration.body {
-                let body = types.resolve(body, &env, declaration.line)?;
-                tuple_arity = tuple_arity.max(types.max_tuple_arity(body));
-            }
-        }
-    }
-    for declaration in &document.traits {
-        types.parameter_environments(&declaration.parameters, declaration.line)?;
-    }
-    let mut primitives = Vec::new();
-    for function in &document.functions {
-        primitives.extend(types.expand_function(function)?);
-    }
-    for declaration in &document.traits {
-        for trait_env in types.parameter_environments(&declaration.parameters, declaration.line)? {
-            let args = declaration
-                .parameters
-                .iter()
-                .map(|b| trait_env[&b.name])
-                .collect();
-            let receiver = types.nominal(&declaration.name, args, declaration.line)?;
-            for member in &declaration.members {
-                for env in types.parameter_environments_with_parent(
-                    &member.parameters,
-                    &trait_env,
-                    member.line,
-                )? {
-                    let member_input = types.resolve(&member.input, &env, member.line)?;
-                    let output = types.resolve(&member.output, &env, member.line)?;
-                    let input = match &types[member_input] {
-                        Type::Unit => receiver,
-                        Type::Product(items) => {
-                            let mut tuple = vec![receiver];
-                            tuple.extend_from_slice(items);
-                            types.intern(Type::Product(tuple))
-                        }
-                        _ => types.intern(Type::Product(vec![receiver, member_input])),
-                    };
-                    primitives.push(Primitive {
-                        name: format!("{}.{}", declaration.name, member.name),
-                        input,
-                        output,
-                        line: member.line,
-                        description: member.description.clone(),
-                        substitutions: env,
-                    });
-                }
-            }
-        }
-    }
-    let mut names = HashSet::new();
-    let mut features = Vec::new();
-    for feature in &document.features {
-        if !names.insert(&feature.name) {
-            return Err(invalid(
-                feature.line,
-                format!("duplicate feature '{}'", feature.name),
-            ));
-        }
-        features.extend(types.expand_function(feature)?);
-    }
+    let mut tuple_arity = types.validate_declarations(document)?;
+    let primitives = types.expand_primitives(document)?;
+    let features = types.expand_features(&document.features)?;
     check_overloads(&primitives, &mut types)?;
     for function in primitives.iter().chain(&features) {
         tuple_arity = tuple_arity
@@ -938,6 +1043,21 @@ fn builtin_names() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+/// A bound type parameter is a value of the type language, not a type constructor.
+fn check_parameter_reference(
+    name: &str,
+    args: &[syntax::TypeExpr],
+    line: usize,
+) -> Result<(), ValidationError> {
+    if !args.is_empty() {
+        return Err(invalid(
+            line,
+            format!("type parameter '{name}' cannot have arguments"),
+        ));
+    }
+    Ok(())
 }
 
 fn invalid(line: usize, message: impl Into<String>) -> ValidationError {

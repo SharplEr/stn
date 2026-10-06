@@ -432,84 +432,107 @@ impl ProofChecker<'_> {
             .proofs
             .get(id)
             .ok_or("proof contains an invalid proof identifier")?;
-        if self.types.get(p.input).is_none() || self.types.get(p.output).is_none() {
+        self.check_endpoints(p)?;
+        self.check_node(id, p)?;
+        self.visiting.remove(&id);
+        self.visited.insert(id);
+        Ok(())
+    }
+
+    /// Require both endpoints to refer to existing nodes before any structural lookup.
+    fn check_endpoints(&self, proof: &Proof) -> Result<(), String> {
+        if self.types.get(proof.input).is_none() || self.types.get(proof.output).is_none() {
             return Err("proof contains an invalid type identifier".into());
         }
-        let (valid, cost) = match &p.node {
+        Ok(())
+    }
+
+    /// Check premises first, then compare the node's contract and unfolded cost.
+    /// Cost overflow is diagnosed before an invalid rule or stored cost.
+    fn check_node(&mut self, id: ProofId, proof: &Proof) -> Result<(), String> {
+        if let ProofNode::Inference { children, .. } = &proof.node {
+            for &child in children {
+                self.visit(child)?;
+            }
+        }
+        let valid = self.matches_node(proof);
+        let cost = self.expected_cost(proof)?;
+        if !valid || cost != proof.cost {
+            return Err(format!(
+                "invalid proof node: {}",
+                self.proofs.expression(id, self.types)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compare primitive metadata or inference endpoints against their semantic contract.
+    /// Children have already been checked, so their identifiers can be indexed safely.
+    fn matches_node(&self, p: &Proof) -> bool {
+        match &p.node {
             ProofNode::Primitive {
                 id,
                 name,
                 line,
                 substitutions,
                 description,
-            } => {
-                let valid = self.primitives.get(*id).is_some_and(|decl| {
-                    decl.input == p.input
-                        && decl.output == p.output
-                        && decl.name == *name
-                        && decl.line == *line
-                        && decl.substitutions == *substitutions
-                        && decl.description == *description
-                });
-                (valid, Cost {
-                    functions: 1,
-                    rules: 0,
-                })
-            }
-            ProofNode::Inference { rule, children } => {
-                for &child in children {
-                    self.visit(child)?;
-                }
-                let valid = match children.as_slice() {
-                    [] => seed_valid(*rule, p.input, p.output, self.types),
-                    [c] => unary_valid(*rule, p.input, p.output, &self.proofs[*c], self.types),
-                    [l, r] => {
-                        let l = &self.proofs[*l];
-                        let r = &self.proofs[*r];
-                        match rule {
-                            Rule::Compose => {
-                                p.input == l.input && l.output == r.input && p.output == r.output
-                            }
-                            Rule::Fanout => {
-                                p.input == l.input
-                                    && l.input == r.input
-                                    && matches!(&self.types[p.output], Type::Product(items) if items.as_slice() == [l.output, r.output])
-                            }
-                            _ => false,
+            } => self.primitives.get(*id).is_some_and(|decl| {
+                decl.input == p.input
+                    && decl.output == p.output
+                    && decl.name == *name
+                    && decl.line == *line
+                    && decl.substitutions == *substitutions
+                    && decl.description == *description
+            }),
+            ProofNode::Inference { rule, children } => match children.as_slice() {
+                [] => seed_valid(*rule, p.input, p.output, self.types),
+                [c] => unary_valid(*rule, p.input, p.output, &self.proofs[*c], self.types),
+                [l, r] => {
+                    let l = &self.proofs[*l];
+                    let r = &self.proofs[*r];
+                    match rule {
+                        Rule::Compose => {
+                            p.input == l.input && l.output == r.input && p.output == r.output
                         }
+                        Rule::Fanout => {
+                            p.input == l.input
+                                && l.input == r.input
+                                && matches!(&self.types[p.output], Type::Product(items) if items.as_slice() == [l.output, r.output])
+                        }
+                        _ => false,
                     }
-                    _ => false,
-                };
-                let cost = children.iter().try_fold(
-                    Cost {
-                        functions: 0,
-                        rules: 1,
-                    },
-                    |sum, c| {
-                        Ok::<_, String>(Cost {
-                            functions: sum
-                                .functions
-                                .checked_add(self.proofs[*c].cost.functions)
-                                .ok_or("proof cost overflow")?,
-                            rules: sum
-                                .rules
-                                .checked_add(self.proofs[*c].cost.rules)
-                                .ok_or("proof cost overflow")?,
-                        })
-                    },
-                )?;
-                (valid, cost)
-            }
-        };
-        if !valid || cost != p.cost {
-            return Err(format!(
-                "invalid proof node: {}",
-                self.proofs.expression(id, self.types)
-            ));
+                }
+                _ => false,
+            },
         }
-        self.visiting.remove(&id);
-        self.visited.insert(id);
-        Ok(())
+    }
+
+    /// Count every premise occurrence, rejecting arithmetic overflow in shared DAGs.
+    fn expected_cost(&self, proof: &Proof) -> Result<Cost, String> {
+        match &proof.node {
+            ProofNode::Primitive { .. } => Ok(Cost {
+                functions: 1,
+                rules: 0,
+            }),
+            ProofNode::Inference { children, .. } => children.iter().try_fold(
+                Cost {
+                    functions: 0,
+                    rules: 1,
+                },
+                |sum, c| {
+                    Ok::<_, String>(Cost {
+                        functions: sum
+                            .functions
+                            .checked_add(self.proofs[*c].cost.functions)
+                            .ok_or("proof cost overflow")?,
+                        rules: sum
+                            .rules
+                            .checked_add(self.proofs[*c].cost.rules)
+                            .ok_or("proof cost overflow")?,
+                    })
+                },
+            ),
+        }
     }
 }
 
