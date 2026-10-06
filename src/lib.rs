@@ -239,7 +239,10 @@ pub fn validate_source(
     source: String,
     options: &ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
-    let specification = model::elaborate(syntax::SourceText::new(source).parse()?)?;
-    let result = search::search(specification, options);
-    Ok(result.into_report(source_name))
+    syntax::SourceText::new(source)
+        .parse()
+        .map_err(ValidationError::from)
+        .and_then(model::elaborate)
+        .map(|specification| search::search(specification, options))
+        .map(|result| result.into_report(source_name))
 }
