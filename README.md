@@ -185,6 +185,8 @@ rebuilds the set and explicitly remaps the surviving roots and child references.
 Type identifier sets also use `IndexSet` for hash lookup and deterministic
 insertion-order iteration. Set equality is independent of insertion order.
 Before rule indexing, the search universe is explicitly sorted by type structure.
+`SearchUniverse` retains that sorted `IndexSet` for both indexed access and
+reverse lookup, without rebuilding a vector and a separate lookup table.
 
 Lookup-only tables and membership-only sets use `HashMap` and `HashSet`.
 Traversed declaration and search collections use `IndexMap` and `IndexSet` for
@@ -200,7 +202,16 @@ reproducible iteration. Parameter environments and proof substitutions retain
 - `src/main.rs`: declarative `clap` arguments and command execution through `Result`,
   with contextual errors handled once at the program boundary.
 
-The agenda implements generalized Dijkstra search over morphism pairs.
+`search::run` coordinates universe construction, rule preparation, search, and
+witness checking. `SearchUniverse` owns the fixed type ordering and local indices;
+`RuleIndex` records input adaptations, collection lifts, and admitted fanout products.
+`ProofSearch` owns the settled relation and its incoming/outgoing indices. Its
+main loop settles a candidate, then delegates to separate methods for collection
+lifts, input restriction, sum extension, composition, and fanout.
+
+The agenda implements generalized Dijkstra search over morphism pairs. It borrows
+the proof store and carries the remaining budget, so offering an inference handles
+endpoint translation, cost calculation, deduplication, and budget accounting together.
 Unary rules and collection lifts are indexed by premise pairs; composition uses
 incoming/outgoing indexes and fanout uses admitted product targets. Every parent
 has greater lexicographic cost than either premise, so the first settled cost

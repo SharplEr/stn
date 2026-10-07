@@ -15,7 +15,7 @@ type Pair = (usize, usize);
 /// Unary rule instances indexed by their required child morphism's type pair.
 /// Each entry lists the resulting pair and the rule that produces it.
 /// Only key lookup is used; premise order comes from the search agenda.
-type UnaryIndex = HashMap<Pair, Vec<(Pair, Rule)>>;
+type LiftIndex = HashMap<Pair, Vec<(Pair, Rule)>>;
 
 /// Work allowance shared by type generation, rule indexing, and agenda operations.
 /// Exhaustion stops certification and yields an incomplete-search diagnostic.
@@ -330,7 +330,13 @@ fn exhaustive_universe(
 /// Pending proof identifiers for generalized Dijkstra search over type pairs.
 /// Interned identifiers break equal-cost ties in deterministic insertion order.
 /// Offered costs are tentative until a candidate settles.
-struct Agenda {
+struct Agenda<'a> {
+    /// Fixed type universe used to translate indexed pairs into proof endpoints.
+    universe: &'a SearchUniverse,
+    /// Shared storage for pending and settled proof records.
+    proofs: &'a mut ProofStore,
+    /// Work allowance remaining after universe construction.
+    budget: Budget,
     /// Maximum distinct alternatives offered at the best cost for each pair.
     limit: usize,
     /// Minimum-cost queue; proof records live exclusively in the proof store.
@@ -340,9 +346,17 @@ struct Agenda {
     /// Proof identifiers offered at each pair's best cost, checked without iteration.
     seen: HashMap<Pair, HashSet<ProofId>>,
 }
-impl Agenda {
-    fn new(limit: usize) -> Self {
+impl<'a> Agenda<'a> {
+    fn new(
+        universe: &'a SearchUniverse,
+        proofs: &'a mut ProofStore,
+        budget: Budget,
+        limit: usize,
+    ) -> Self {
         Self {
+            universe,
+            proofs,
+            budget,
             limit,
             heap: BinaryHeap::new(),
             best_offered: HashMap::new(),
@@ -352,14 +366,8 @@ impl Agenda {
     /// Offer a candidate at its pair's best known cost, resetting alternatives
     /// when a cheaper cost arrives. Reject worse, duplicate, or excess candidates
     /// before inserting records; settlement later establishes minimum costs.
-    fn offer(
-        &mut self,
-        pair: Pair,
-        candidate: Proof,
-        proofs: &mut ProofStore,
-        budget: &mut Budget,
-    ) -> Result<(), String> {
-        budget.tick()?;
+    fn offer(&mut self, pair: Pair, candidate: Proof) -> Result<(), String> {
+        self.budget.tick()?;
         if self
             .best_offered
             .get(&pair)
@@ -379,18 +387,31 @@ impl Agenda {
         if alternatives.len() >= self.limit {
             return Ok(());
         }
-        if proofs
+        if self
+            .proofs
             .find(&candidate)
             .is_some_and(|id| alternatives.contains(&id))
         {
             return Ok(());
         }
         let cost = candidate.cost;
-        let id = proofs.insert(candidate);
+        let id = self.proofs.insert(candidate);
         alternatives.insert(id);
         self.heap.push(Reverse((cost, id)));
         Ok(())
     }
+
+    /// Construct an inference using indexed endpoints and offer it at its computed cost.
+    fn infer(&mut self, pair: Pair, rule: Rule, children: Vec<ProofId>) -> Result<(), String> {
+        let candidate = self.proofs.inference(
+            self.universe.members[pair.0],
+            self.universe.members[pair.1],
+            rule,
+            children,
+        );
+        self.offer(pair, candidate)
+    }
+
     fn pop(&mut self) -> Option<ProofId> {
         let Reverse((_, id)) = self.heap.pop()?;
         Some(id)
@@ -518,12 +539,398 @@ fn incomplete_statuses(count: usize, reason: String) -> Vec<FeatureStatus> {
     vec![FeatureStatus::SearchIncomplete { reason }; count]
 }
 
-/// Solve all goals over the chosen finite type universe using generalized Dijkstra.
-/// Index unary rules, restrictions, sum extensions, and admitted fanout products;
-/// combine settled pairs through incoming/outgoing composition indexes. Positive
-/// inference costs permit stopping after all minimum goal alternatives settle.
-/// Independently check returned witnesses; exhausted goals get diagnostics about
-/// this universe, while resource or witness-check failures propagate to `search`.
+/// Finite search universe with deterministic ordering and dense local indices.
+/// The type store may intern more nodes, but only these members can be proof endpoints.
+struct SearchUniverse {
+    /// Admitted types sorted by semantic structure, independent of allocation order.
+    /// The set provides both indexed access and reverse lookup by type identifier.
+    members: IndexSet<TypeId>,
+    /// Direct structural view of each member, cached for rule preparation.
+    shapes: Vec<TypeId>,
+}
+
+impl SearchUniverse {
+    /// Generate the selected bounded universe, then assign stable indices for rule lookup.
+    fn build(
+        primitives: &[Primitive],
+        features: &[Primitive],
+        types: &mut TypeStore,
+        options: &ValidationOptions,
+        tuple_arity: usize,
+        budget: &mut Budget,
+    ) -> Result<Self, String> {
+        let explicit = explicit_types(primitives, features, types, options)?;
+        let mut members = if options.exhaustive {
+            exhaustive_universe(&explicit, types, options, budget, tuple_arity)?
+        } else {
+            relevant_universe(&explicit, primitives, types, options, budget)?
+        };
+        members.sort_unstable_by(|a, b| types.compare(*a, *b));
+        let shapes = members.iter().map(|t| types.shape(*t)).collect();
+        Ok(Self { members, shapes })
+    }
+
+    /// Find the local index of a type required to belong to this universe.
+    fn index_of(&self, ty: TypeId) -> usize {
+        self.members
+            .get_index_of(&ty)
+            .expect("type belongs to the search universe")
+    }
+
+    /// Translate endpoints known to belong to this universe into a search key.
+    fn pair(&self, input: TypeId, output: TypeId) -> Pair {
+        (self.index_of(input), self.index_of(output))
+    }
+}
+
+/// Prepared inference relationships that remain fixed throughout proof search.
+/// Indices select applicable rules without rescanning the entire type universe.
+struct RuleIndex {
+    /// Collection lifts keyed by the element-level morphism they require.
+    lifts: LiftIndex,
+    /// Narrower inputs accepted by a morphism with the indexed input type.
+    restrictions: Vec<Vec<usize>>,
+    /// Sum inputs containing all alternatives handled by the indexed input type.
+    sums: Vec<Vec<usize>>,
+    /// Admitted anonymous binary products keyed by their ordered component indices.
+    fanouts: HashMap<Pair, usize>,
+}
+
+impl RuleIndex {
+    fn new(type_count: usize) -> Self {
+        Self {
+            lifts: LiftIndex::new(),
+            restrictions: vec![Vec::new(); type_count],
+            sums: vec![Vec::new(); type_count],
+            fanouts: HashMap::new(),
+        }
+    }
+
+    /// Register only anonymous binary products as results constructible by fanout.
+    fn index_product(&mut self, index: usize, universe: &SearchUniverse, types: &TypeStore) {
+        if let Type::Product(items) = &types[universe.members[index]] {
+            if let [left, right] = items.as_slice() {
+                self.fanouts.insert(universe.pair(*left, *right), index);
+            }
+        }
+    }
+
+    /// Index input adaptation and collection lifting for one ordered pair of types.
+    /// Nominal collection targets must obey the directed construction rules.
+    fn index_pair(&mut self, pair: Pair, universe: &SearchUniverse, types: &TypeStore) {
+        let (i, j) = pair;
+        let (a, b) = (universe.members[i], universe.members[j]);
+        if a != b && types.accepts(a, b) {
+            self.restrictions[i].push(j);
+        }
+        if a != b
+            && types
+                .handled_variants(a)
+                .is_subset(&types.source_variants(b))
+        {
+            self.sums[i].push(j);
+        }
+        let (source_shape, target_shape) = (universe.shapes[i], universe.shapes[j]);
+        if !proof::collection_target_allowed(a, b, source_shape, target_shape, types) {
+            return;
+        }
+        let premise = match (&types[source_shape], &types[target_shape]) {
+            (Type::List(s), Type::List(t)) => Some((s, t, Rule::MapList)),
+            (Type::Set(s), Type::Set(t)) => Some((s, t, Rule::MapSet)),
+            (Type::Map(k, s), Type::Map(l, t)) if k == l => Some((s, t, Rule::MapValues)),
+            _ => None,
+        };
+        if let Some((s, t, rule)) = premise {
+            if let (Some(l), Some(r)) = (
+                universe.members.get_index_of(s),
+                universe.members.get_index_of(t),
+            ) {
+                self.lifts.entry((l, r)).or_default().push((pair, rule));
+            }
+        }
+        if let (Type::List(s), Type::List(_)) = (&types[source_shape], &types[target_shape]) {
+            if let (Some(l), Some(r)) = (
+                universe.members.get_index_of(s),
+                universe.members.get_index_of(&target_shape),
+            ) {
+                self.lifts
+                    .entry((l, r))
+                    .or_default()
+                    .push((pair, Rule::FlatMap));
+            }
+        }
+    }
+}
+
+/// One search over a fixed universe: pending candidates, settled witnesses, and rule indices.
+/// The owning stores are borrowed for the run; proofs refer to shared nodes by identifier.
+struct ProofSearch<'a> {
+    /// Admitted endpoints and their dense local indices.
+    universe: &'a SearchUniverse,
+    /// Shared type graph, also used to normalize results of sum extension.
+    types: &'a mut TypeStore,
+    /// Candidate queue, proof storage, alternative limit, and remaining work budget.
+    agenda: Agenda<'a>,
+    /// Structural relationships prepared before processing the queue.
+    rules: RuleIndex,
+    /// Accepted minimum-cost witnesses for each derivable type pair.
+    settled: HashMap<Pair, Vec<ProofId>>,
+    /// Settled output indices for each input, in discovery order.
+    outgoing: Vec<IndexSet<usize>>,
+    /// Settled input indices for each output, in discovery order.
+    incoming: Vec<IndexSet<usize>>,
+}
+
+impl<'a> ProofSearch<'a> {
+    fn new(
+        universe: &'a SearchUniverse,
+        types: &'a mut TypeStore,
+        proofs: &'a mut ProofStore,
+        budget: Budget,
+        max_proofs: usize,
+    ) -> Self {
+        let type_count = universe.members.len();
+        Self {
+            universe,
+            types,
+            agenda: Agenda::new(universe, proofs, budget, max_proofs),
+            rules: RuleIndex::new(type_count),
+            settled: HashMap::new(),
+            outgoing: vec![IndexSet::new(); type_count],
+            incoming: vec![IndexSet::new(); type_count],
+        }
+    }
+
+    /// Prepare rule lookups and seed proofs in deterministic type and declaration order.
+    /// Budget charges and candidate insertion order also determine bounded-run outcomes.
+    fn prepare(&mut self, primitives: &[Primitive]) -> Result<(), String> {
+        for source in 0..self.universe.members.len() {
+            self.seed_structural(source)?;
+            self.rules.index_product(source, self.universe, self.types);
+            for target in 0..self.universe.members.len() {
+                self.agenda.budget.tick()?;
+                self.rules
+                    .index_pair((source, target), self.universe, self.types);
+                self.seed_narrowing((source, target))?;
+            }
+        }
+        for (id, primitive) in primitives.iter().enumerate() {
+            let pair = self.universe.pair(primitive.input, primitive.output);
+            self.agenda.offer(pair, Proof::primitive(id, primitive))?;
+        }
+        Ok(())
+    }
+
+    /// Seed identity, the direct nominal view, and all available product projections.
+    fn seed_structural(&mut self, source: usize) -> Result<(), String> {
+        self.agenda
+            .infer((source, source), Rule::Identity, vec![])?;
+        let shape = self.universe.shapes[source];
+        if shape != self.universe.members[source] {
+            if let Some(target) = self.universe.members.get_index_of(&shape) {
+                self.agenda.infer((source, target), Rule::View, vec![])?;
+            }
+        }
+        if let Type::Product(items) = &self.types[shape] {
+            for (component, item) in items.iter().enumerate() {
+                let target = self.universe.index_of(*item);
+                self.agenda
+                    .infer((source, target), Rule::Project(component), vec![])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Seed the collection-narrowing rules whose endpoint contracts hold for this pair.
+    fn seed_narrowing(&mut self, pair: Pair) -> Result<(), String> {
+        if pair.0 == pair.1 {
+            return Ok(());
+        }
+        let (input, output) = (self.universe.members[pair.0], self.universe.members[pair.1]);
+        for rule in [Rule::NarrowList, Rule::NarrowSet, Rule::NarrowKeys] {
+            if proof::seed_valid(rule, input, output, self.types) {
+                self.agenda.infer(pair, rule, vec![])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle candidates by increasing cost and derive their immediate consequences.
+    /// Stop after all goal minima and their retained equal-cost alternatives are settled.
+    fn solve(&mut self, features: &[Primitive]) -> Result<(), String> {
+        let goals = features
+            .iter()
+            .map(|feature| self.universe.pair(feature.input, feature.output))
+            .collect::<Vec<_>>();
+        while let Some(proof) = self.agenda.pop() {
+            let candidate = &self.agenda.proofs[proof];
+            let pair = self.universe.pair(candidate.input, candidate.output);
+            let cost = candidate.cost;
+            self.agenda.budget.tick()?;
+            if self.goals_finished(&goals, cost) {
+                break;
+            }
+            if self.settle(pair, proof) {
+                self.derive(pair, proof)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A more expensive candidate cannot improve completed goals: every inference
+    /// costs strictly more than each premise. Equal-cost candidates are still processed.
+    fn goals_finished(&self, goals: &[Pair], next_cost: Cost) -> bool {
+        if !goals.iter().all(|goal| self.settled.contains_key(goal)) {
+            return false;
+        }
+        goals
+            .iter()
+            .map(|goal| self.agenda.proofs[self.settled[goal][0]].cost)
+            .max()
+            .is_some_and(|last_goal| next_cost > last_goal)
+    }
+
+    /// Accept a minimum-cost alternative and update both composition lookup directions.
+    /// More expensive or excess alternatives remain unused in the proof store.
+    fn settle(&mut self, pair: Pair, proof: ProofId) -> bool {
+        let alternatives = self.settled.entry(pair).or_default();
+        if alternatives
+            .first()
+            .is_some_and(|best| self.agenda.proofs[*best].cost < self.agenda.proofs[proof].cost)
+            || alternatives.len() >= self.agenda.limit
+        {
+            return false;
+        }
+        alternatives.push(proof);
+        self.outgoing[pair.0].insert(pair.1);
+        self.incoming[pair.1].insert(pair.0);
+        true
+    }
+
+    /// Offer all consequences of a newly settled witness in a fixed rule order.
+    fn derive(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        self.lift_collections(pair, proof)?;
+        self.restrict_input(pair, proof)?;
+        self.extend_sums(pair, proof)?;
+        self.compose(pair, proof)?;
+        self.fanout(pair, proof)
+    }
+
+    /// Lift an element-level witness into each indexed collection context.
+    fn lift_collections(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        if let Some(lifts) = self.rules.lifts.get(&pair) {
+            for &(target, rule) in lifts {
+                self.agenda.infer(target, rule, vec![proof])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adapt the witness to every indexed narrower input contract.
+    fn restrict_input(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        for &source in &self.rules.restrictions[pair.0] {
+            self.agenda
+                .infer((source, pair.1), Rule::RestrictInput, vec![proof])?;
+        }
+        Ok(())
+    }
+
+    /// Carry unhandled sum alternatives alongside the witness output.
+    /// Normalization may intern a type, but only admitted outputs produce candidates.
+    fn extend_sums(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        let (input, output) = (self.universe.members[pair.0], self.universe.members[pair.1]);
+        for &source in &self.rules.sums[pair.0] {
+            let variants = self.types.source_variants(self.universe.members[source]);
+            let handled = self.types.handled_variants(input);
+            let result = self.types.union(
+                std::iter::once(output)
+                    .chain(variants.difference(&handled).copied())
+                    .collect(),
+            );
+            if let Some(target) = self.universe.members.get_index_of(&result) {
+                self.agenda
+                    .infer((source, target), Rule::ExtendSum, vec![proof])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compose with settled successors and predecessors, so either arrival order works.
+    fn compose(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        let (input, output) = pair;
+        for &target in &self.outgoing[output] {
+            for &next in &self.settled[&(output, target)] {
+                self.agenda
+                    .infer((input, target), Rule::Compose, vec![proof, next])?;
+            }
+        }
+        for &source in &self.incoming[input] {
+            for &previous in &self.settled[&(source, input)] {
+                self.agenda
+                    .infer((source, output), Rule::Compose, vec![previous, proof])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pair witnesses sharing an input, considering both orders of the output product.
+    fn fanout(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
+        let (input, output) = pair;
+        for &other_output in &self.outgoing[input] {
+            for &other in &self.settled[&(input, other_output)] {
+                for (outputs, children) in [
+                    ((output, other_output), [proof, other]),
+                    ((other_output, output), [other, proof]),
+                ] {
+                    if let Some(&target) = self.rules.fanouts.get(&outputs) {
+                        self.agenda
+                            .infer((input, target), Rule::Fanout, children.to_vec())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Independently check each reported witness and diagnose goals with no derivation.
+    /// Reachable outputs are sampled in discovery order from the settled relation.
+    fn check_features(
+        &self,
+        primitives: &[Primitive],
+        features: &[Primitive],
+    ) -> Result<Vec<FeatureStatus>, String> {
+        features
+            .iter()
+            .map(|feature| {
+                let goal = self.universe.pair(feature.input, feature.output);
+                match self.settled.get(&goal) {
+                    Some(witnesses) => {
+                        for &proof in witnesses {
+                            self.agenda
+                                .proofs
+                                .check_against(proof, primitives, self.types)?;
+                        }
+                        Ok(FeatureStatus::Proved {
+                            proofs: witnesses.clone(),
+                        })
+                    }
+                    None => {
+                        let reachable = self.outgoing[goal.0]
+                            .iter()
+                            .take(16)
+                            .map(|&index| self.universe.members[index])
+                            .collect::<Vec<_>>();
+                        let reason = failure_reason(feature.output, &reachable, self.types);
+                        Ok(FeatureStatus::UnresolvableWithinUniverse { reason, reachable })
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+/// Build the finite universe, prepare rules, solve goals, and verify the resulting witnesses.
+/// Resource or witness-check failures propagate to `search`, which marks the run incomplete.
 fn run(
     primitives: &[Primitive],
     features: &[Primitive],
@@ -538,239 +945,18 @@ fn run(
     let mut budget = Budget {
         remaining: options.max_steps.get(),
     };
-    let explicit = explicit_types(primitives, features, types, options)?;
-    let known = if options.exhaustive {
-        exhaustive_universe(&explicit, types, options, &mut budget, tuple_arity)?
-    } else {
-        relevant_universe(&explicit, primitives, types, options, &mut budget)?
-    };
-    let mut universe = known.into_iter().collect::<Vec<_>>();
-    universe.sort_unstable_by(|a, b| types.compare(*a, *b));
-    let ids = universe
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, i))
-        .collect::<HashMap<_, _>>();
-    let mut agenda = Agenda::new(options.max_proofs.get());
-    let mut unary = UnaryIndex::new();
-    let mut restrictions = vec![Vec::new(); universe.len()];
-    let mut sums = vec![Vec::new(); universe.len()];
-    let shapes = universe.iter().map(|t| types.shape(*t)).collect::<Vec<_>>();
-    let mut fanouts = HashMap::<Pair, usize>::new();
-    for (i, &a) in universe.iter().enumerate() {
-        agenda.offer(
-            (i, i),
-            proofs.inference(a, a, Rule::Identity, vec![]),
-            proofs,
-            &mut budget,
-        )?;
-        if shapes[i] != a {
-            if let Some(&j) = ids.get(&shapes[i]) {
-                agenda.offer(
-                    (i, j),
-                    proofs.inference(a, shapes[i], Rule::View, vec![]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        if let Type::Product(items) = &types[shapes[i]] {
-            for (k, t) in items.iter().enumerate() {
-                let j = ids[t];
-                agenda.offer(
-                    (i, j),
-                    proofs.inference(a, *t, Rule::Project(k), vec![]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        if let Type::Product(items) = &types[a] {
-            if let [l, r] = items.as_slice() {
-                fanouts.insert((ids[l], ids[r]), i);
-            }
-        }
-        for (j, &b) in universe.iter().enumerate() {
-            budget.tick()?;
-            if a != b && types.accepts(a, b) {
-                restrictions[i].push(j);
-            }
-            if a != b
-                && types
-                    .handled_variants(a)
-                    .is_subset(&types.source_variants(b))
-            {
-                sums[i].push(j);
-            }
-            for rule in [Rule::NarrowList, Rule::NarrowSet, Rule::NarrowKeys] {
-                if i != j && proof::seed_valid(rule, a, b, types) {
-                    agenda.offer(
-                        (i, j),
-                        proofs.inference(a, b, rule, vec![]),
-                        proofs,
-                        &mut budget,
-                    )?;
-                }
-            }
-            if !proof::collection_target_allowed(a, b, shapes[i], shapes[j], types) {
-                continue;
-            }
-            let premise = match (&types[shapes[i]], &types[shapes[j]]) {
-                (Type::List(s), Type::List(t)) => Some((s, t, Rule::MapList)),
-                (Type::Set(s), Type::Set(t)) => Some((s, t, Rule::MapSet)),
-                (Type::Map(k, s), Type::Map(l, t)) if k == l => Some((s, t, Rule::MapValues)),
-                _ => None,
-            };
-            if let Some((s, t, rule)) = premise {
-                if let (Some(&l), Some(&r)) = (ids.get(s), ids.get(t)) {
-                    unary.entry((l, r)).or_default().push(((i, j), rule));
-                }
-            }
-            if let (Type::List(s), Type::List(_)) = (&types[shapes[i]], &types[shapes[j]]) {
-                if let (Some(&l), Some(&r)) = (ids.get(s), ids.get(&shapes[j])) {
-                    unary
-                        .entry((l, r))
-                        .or_default()
-                        .push(((i, j), Rule::FlatMap));
-                }
-            }
-        }
-    }
-    for (id, p) in primitives.iter().enumerate() {
-        agenda.offer(
-            (ids[&p.input], ids[&p.output]),
-            Proof::primitive(id, p),
-            proofs,
-            &mut budget,
-        )?;
-    }
-    let goals = features
-        .iter()
-        .map(|f| (ids[&f.input], ids[&f.output]))
-        .collect::<Vec<_>>();
-    let mut settled = HashMap::<Pair, Vec<ProofId>>::new();
-    let mut outgoing = vec![IndexSet::new(); universe.len()];
-    let mut incoming = vec![IndexSet::new(); universe.len()];
-    while let Some(p) = agenda.pop() {
-        let (input, output, cost) = {
-            let node = &proofs[p];
-            (node.input, node.output, node.cost)
-        };
-        budget.tick()?;
-        // Every parent costs strictly more than each premise. Once all goals
-        // are settled, larger agenda costs cannot yield cheaper alternatives.
-        if goals.iter().all(|g| settled.contains_key(g)) {
-            let last_goal = goals
-                .iter()
-                .map(|g| proofs[settled[g][0]].cost)
-                .max()
-                .unwrap();
-            if cost > last_goal {
-                break;
-            }
-        }
-        let (a, b) = (ids[&input], ids[&output]);
-        let alternatives = settled.entry((a, b)).or_default();
-        if alternatives
-            .first()
-            .is_some_and(|best| proofs[*best].cost < cost)
-            || alternatives.len() >= options.max_proofs.get()
-        {
-            continue;
-        }
-        alternatives.push(p);
-        outgoing[a].insert(b);
-        incoming[b].insert(a);
-        if let Some(lifts) = unary.get(&(a, b)) {
-            for &((s, t), rule) in lifts {
-                agenda.offer(
-                    (s, t),
-                    proofs.inference(universe[s], universe[t], rule, vec![p]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        for &s in &restrictions[a] {
-            agenda.offer(
-                (s, b),
-                proofs.inference(universe[s], output, Rule::RestrictInput, vec![p]),
-                proofs,
-                &mut budget,
-            )?;
-        }
-        for &s in &sums[a] {
-            let variants = types.source_variants(universe[s]);
-            let handled = types.handled_variants(input);
-            let result = types.union(
-                std::iter::once(output)
-                    .chain(variants.difference(&handled).cloned())
-                    .collect(),
-            );
-            if let Some(&t) = ids.get(&result) {
-                agenda.offer(
-                    (s, t),
-                    proofs.inference(universe[s], result, Rule::ExtendSum, vec![p]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        for &c in &outgoing[b] {
-            for &q in &settled[&(b, c)] {
-                agenda.offer(
-                    (a, c),
-                    proofs.inference(input, proofs[q].output, Rule::Compose, vec![p, q]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        for &x in &incoming[a] {
-            for &q in &settled[&(x, a)] {
-                agenda.offer(
-                    (x, b),
-                    proofs.inference(proofs[q].input, output, Rule::Compose, vec![q, p]),
-                    proofs,
-                    &mut budget,
-                )?;
-            }
-        }
-        for &c in &outgoing[a] {
-            for &q in &settled[&(a, c)] {
-                for (outputs, children) in [((b, c), [p, q]), ((c, b), [q, p])] {
-                    if let Some(&t) = fanouts.get(&outputs) {
-                        agenda.offer(
-                            (a, t),
-                            proofs.inference(input, universe[t], Rule::Fanout, children.to_vec()),
-                            proofs,
-                            &mut budget,
-                        )?;
-                    }
-                }
-            }
-        }
-    }
-    let mut statuses = Vec::new();
-    for (feature, &goal) in features.iter().zip(&goals) {
-        if let Some(witnesses) = settled.get(&goal) {
-            for &p in witnesses {
-                proofs.check_against(p, primitives, types)?;
-            }
-            statuses.push(FeatureStatus::Proved {
-                proofs: witnesses.clone(),
-            });
-        } else {
-            let reachable = outgoing[goal.0]
-                .iter()
-                .take(16)
-                .map(|&t| universe[t])
-                .collect::<Vec<_>>();
-            let reason = failure_reason(feature.output, &reachable, types);
-            statuses.push(FeatureStatus::UnresolvableWithinUniverse { reason, reachable });
-        }
-    }
-    Ok(statuses)
+    let universe = SearchUniverse::build(
+        primitives,
+        features,
+        types,
+        options,
+        tuple_arity,
+        &mut budget,
+    )?;
+    let mut search = ProofSearch::new(&universe, types, proofs, budget, options.max_proofs.get());
+    search.prepare(primitives)?;
+    search.solve(features)?;
+    search.check_features(primitives, features)
 }
 
 /// Explain common missing steps using the bounded sample of reachable outputs:
