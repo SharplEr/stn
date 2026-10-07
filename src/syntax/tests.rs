@@ -198,7 +198,7 @@ fn semantic_errors_are_caught_in_unused_declarations() {
             validate_source(
                 "input",
                 format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
-                &ValidationOptions::default()
+                ValidationOptions::default()
             )
             .is_err(),
             "{defs}"

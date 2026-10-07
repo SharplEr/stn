@@ -234,10 +234,11 @@ impl fmt::Display for ValidationReport {
 /// in feature statuses. The returned report owns both graphs needed by its IDs.
 /// Consume the source `String` without copying its buffer. Lazy line preprocessing
 /// borrows source slices and creates no copies of line substrings.
+/// Transfer the search options into the returned report without cloning them.
 pub fn validate_source(
     source_name: impl Into<String>,
     source: String,
-    options: &ValidationOptions,
+    options: ValidationOptions,
 ) -> Result<ValidationReport, ValidationError> {
     syntax::SourceText::new(source)
         .parse()

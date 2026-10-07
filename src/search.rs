@@ -484,7 +484,7 @@ impl SearchResult {
 /// Any interrupted run makes all goals incomplete, so partial candidates cannot
 /// be reported as certified minima. Compact successful roots and their premises
 /// before returning, rewriting every reported identifier to the compacted store.
-pub(crate) fn search(specification: Specification, options: &ValidationOptions) -> SearchResult {
+pub(crate) fn search(specification: Specification, options: ValidationOptions) -> SearchResult {
     let Specification {
         tuple_arity,
         mut types,
@@ -497,7 +497,7 @@ pub(crate) fn search(specification: Specification, options: &ValidationOptions) 
         &features,
         &mut types,
         &mut proofs,
-        options,
+        &options,
         tuple_arity,
     )
     .unwrap_or_else(|reason| incomplete_statuses(features.len(), reason));
@@ -507,7 +507,7 @@ pub(crate) fn search(specification: Specification, options: &ValidationOptions) 
         features,
         statuses,
         tuple_arity,
-        options: options.clone(),
+        options,
     };
     result.retain_feature_proofs();
     result

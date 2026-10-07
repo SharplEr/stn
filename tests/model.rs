@@ -5,8 +5,7 @@ fn equal_types_share_identifiers_and_nested_nodes() {
     let source = "DEFINITIONS:\nA\nB\nK\nFEATURES:\n\
         canonical: Map<K, List<A | B>> -> Map<K, List<B | (A | B)>>\n\
         nested: List<A | B> -> List<B | A>\n";
-    let report =
-        validate_source("input", source.to_owned(), &ValidationOptions::default()).unwrap();
+    let report = validate_source("input", source.to_owned(), ValidationOptions::default()).unwrap();
     let map = &report.features[0];
     let list = &report.features[1];
     assert_eq!(map.input, map.output);
@@ -41,8 +40,7 @@ fn nominal_families_keep_ordered_arguments_and_distinct_identity() {
         Other<K from Kinds, V from Kinds> = (K, V)\n\
         FEATURES:\nfirst: Pair<A, B> -> (A, B)\n\
         other: Other<A, B> -> (A, B)\nreverse: Pair<B, A> -> (B, A)\n";
-    let report =
-        validate_source("input", source.to_owned(), &ValidationOptions::default()).unwrap();
+    let report = validate_source("input", source.to_owned(), ValidationOptions::default()).unwrap();
     let first = &report.features[0];
     let other = &report.features[1];
     let reverse = &report.features[2];

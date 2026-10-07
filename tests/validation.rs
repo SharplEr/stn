@@ -60,7 +60,7 @@ fn declaration_failures_preserve_diagnostics_and_validation_order() {
         ),
     ] {
         let error =
-            validate_source("input", source.to_owned(), &ValidationOptions::default()).unwrap_err();
+            validate_source("input", source.to_owned(), ValidationOptions::default()).unwrap_err();
         let ValidationError::Invalid(actual) = error else {
             panic!("expected a declaration diagnostic, got {error:?}");
         };
@@ -76,7 +76,7 @@ fn specialization_limit_is_checked_before_resolving_the_body() {
         variants.join("\n"),
         variants.join(" | "),
     );
-    let error = validate_source("input", source, &ValidationOptions::default()).unwrap_err();
+    let error = validate_source("input", source, ValidationOptions::default()).unwrap_err();
     assert!(matches!(error, ValidationError::ExpansionLimit {
         line: 104,
         limit: 100_000
@@ -87,7 +87,7 @@ fn validate(defs: &str, goals: &str) -> ValidationReport {
     validate_source(
         "input",
         format!("DEFINITIONS:\n{defs}\nFEATURES:\n{goals}\n"),
-        &ValidationOptions::default(),
+        ValidationOptions::default(),
     )
     .unwrap()
 }
@@ -324,7 +324,7 @@ fn overloads_with_intersections_are_rejected_even_for_equal_outputs() {
         let error = validate_source(
             "input",
             format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
-            &ValidationOptions::default(),
+            ValidationOptions::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("ambiguous overload"));
@@ -352,7 +352,7 @@ fn generic_specialization_overlap_is_detected() {
     let error = validate_source(
         "input",
         "DEFINITIONS:\nA\nB\nKinds = A | B\nf<T from Kinds>: A -> T\nFEATURES:\n".to_owned(),
-        &ValidationOptions::default(),
+        ValidationOptions::default(),
     )
     .unwrap_err();
     assert!(error.to_string().contains("ambiguous overload"));
@@ -381,7 +381,7 @@ fn existentials_are_alpha_equivalent_but_have_no_implicit_pack_or_unpack() {
 #[test]
 fn declared_deep_shapes_are_admitted_even_at_zero_synthesis_depth() {
     let source = "DEFINITIONS:\nA\nB\nf: List<List<A>> -> B\nFEATURES:\ng: List<List<A>> -> B\n";
-    let report = validate_source("input", source.to_owned(), &ValidationOptions {
+    let report = validate_source("input", source.to_owned(), ValidationOptions {
         max_depth: 0,
         ..ValidationOptions::default()
     })
@@ -404,7 +404,7 @@ fn empty_sections_are_valid_and_cycles_are_rejected_before_expansion() {
         let error = validate_source(
             "input",
             format!("DEFINITIONS:\n{defs}\nFEATURES:\n"),
-            &ValidationOptions::default(),
+            ValidationOptions::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("cyclic"));
@@ -424,7 +424,7 @@ fn resource_exhaustion_never_reports_underivability_or_minimum_cost() {
             ..ValidationOptions::default()
         },
     ] {
-        let report = validate_source("input", source.to_owned(), &options).unwrap();
+        let report = validate_source("input", source.to_owned(), options).unwrap();
         assert!(matches!(
             report.features[0].status,
             FeatureStatus::SearchIncomplete { .. }
@@ -435,7 +435,7 @@ fn resource_exhaustion_never_reports_underivability_or_minimum_cost() {
 #[test]
 fn complete_depth_zero_universe_can_certify_failure() {
     let source = "DEFINITIONS:\nA\nB\nFEATURES:\ng: A -> B\n";
-    let report = validate_source("input", source.to_owned(), &ValidationOptions {
+    let report = validate_source("input", source.to_owned(), ValidationOptions {
         exhaustive: true,
         max_depth: 0,
         ..ValidationOptions::default()
@@ -462,14 +462,14 @@ fn proof_alternative_limit_is_respected_and_results_are_deterministic() {
         ..ValidationOptions::default()
     };
     for source in sources {
-        let report = validate_source("input", source.to_owned(), &options).unwrap();
+        let report = validate_source("input", source.to_owned(), options.clone()).unwrap();
         let FeatureStatus::Proved { proofs } = &report.features[0].status else {
             panic!("expected a proof: {report}");
         };
         assert_eq!(proofs.len(), 1);
         assert_eq!(
             report.to_string(),
-            validate_source("input", source.to_owned(), &options)
+            validate_source("input", source.to_owned(), options.clone())
                 .unwrap()
                 .to_string()
         );
@@ -526,7 +526,7 @@ fn exhaustive_search_can_synthesize_a_product_and_certify_minimum_cost() {
     let report = validate_source(
         "input",
         "DEFINITIONS:\nFEATURES:\nf: () -> ((), ())\n".to_owned(),
-        &ValidationOptions {
+        ValidationOptions {
             exhaustive: true,
             max_depth: 1,
             ..ValidationOptions::default()
@@ -549,7 +549,7 @@ fn full_documentation_examples_keep_their_expected_outcomes() {
             continue;
         }
         count += 1;
-        let result = validate_source("input", source.to_owned(), &ValidationOptions::default());
+        let result = validate_source("input", source.to_owned(), ValidationOptions::default());
         if source.contains("f<T from Choices>") {
             assert!(result.is_err());
         } else {

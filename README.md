@@ -109,7 +109,7 @@ execute the specified functions.
 use stn_validator::{validate_source, ValidationOptions};
 
 let source = String::from("DEFINITIONS:\nA\nFEATURES:\nsame: A -> A\n");
-let report = validate_source("example.stypes", source, &ValidationOptions::default()).unwrap();
+let report = validate_source("example.stypes", source, ValidationOptions::default()).unwrap();
 assert!(!report.has_unresolved_features());
 println!("{report}");
 ```
@@ -118,6 +118,10 @@ println!("{report}");
 Clap rejects zero values during argument parsing, before opening the input file.
 Library callers construct positive limits with `NonZeroUsize::new(value)`;
 `max_depth` remains a `usize` because zero depth is valid.
+
+`validate_source` consumes both the source buffer and `ValidationOptions`.
+The options move through search into the returned report. Callers that reuse
+the same configuration for several runs can explicitly clone it at the call site.
 
 The public API exposes feature statuses, typed proof trees, costs and source
 references. Proof search consumes the elaborated `Specification` and returns

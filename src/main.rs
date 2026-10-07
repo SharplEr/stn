@@ -70,7 +70,7 @@ impl Args {
             target: self.input.display().to_string(),
             source: io_error,
         })?;
-        let report = validate_source(self.input.display().to_string(), input_text, &options)
+        let report = validate_source(self.input.display().to_string(), input_text, options)
             .map_err(|validation_error| CliError::Validation {
                 input: self.input.clone(),
                 source: validation_error,
