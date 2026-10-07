@@ -51,20 +51,22 @@ fn an_exact_step_budget_completes_and_one_less_preserves_exhausted_usage() {
 #[test]
 fn universe_construction_keeps_usage_when_it_exhausts_either_resource() {
     let source = "DEFINITIONS:\nA\nB\nf: A -> B\nFEATURES:\ngoal: A -> B\n";
-    for (options, expected) in [
+    for (options, expected_types, expected_steps) in [
         (
             ValidationOptions {
                 max_types: NonZeroUsize::new(1).unwrap(),
                 ..ValidationOptions::default()
             },
-            SearchUsage { types: 1, steps: 0 },
+            1,
+            Some(0),
         ),
         (
             ValidationOptions {
                 max_steps: NonZeroUsize::new(1).unwrap(),
                 ..ValidationOptions::default()
             },
-            SearchUsage { types: 2, steps: 1 },
+            2,
+            Some(1),
         ),
         (
             ValidationOptions {
@@ -73,12 +75,20 @@ fn universe_construction_keeps_usage_when_it_exhausts_either_resource() {
                 max_types: NonZeroUsize::new(3).unwrap(),
                 ..ValidationOptions::default()
             },
-            SearchUsage { types: 3, steps: 1 },
+            3,
+            None,
         ),
     ] {
         let report = validate_source("input", source.to_owned(), options).unwrap();
         assert!(report.has_incomplete_search());
-        assert_eq!(report.usage, expected);
+        assert_eq!(report.usage.types, expected_types);
+        if let Some(steps) = expected_steps {
+            assert_eq!(report.usage.steps, steps);
+        } else {
+            // Lazy exhaustive generation can hit its type cap after other stages ran.
+            assert!(report.usage.steps > 0);
+            assert!(report.usage.steps < report.options.max_steps.get());
+        }
     }
 }
 

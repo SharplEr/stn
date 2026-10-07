@@ -996,6 +996,25 @@ until no entry changes
 A work queue or weighted hypergraph avoids rescanning all pairs. Keep source
 primitive declarations separately from the truncated proof relation.
 
+The implementation interleaves resumable universe generation, incremental rule
+activation, and a cost-ordered proof queue. Newly activated rules are applied to
+existing premises; improved pairs are reopened. Generated but not yet activated
+types, and deferred generation tasks, cannot be ignored when certifying completion.
+
+A certified lower bound must cover the full selected universe. Equality with a
+checked witness certifies its complete lexicographic cost, not just its primitive
+count. The implementation permits early completion on such equality when the
+alternative cap is filled. Its `h_max` relaxation currently covers relevant
+domains containing only opaque types, products, and nominal views. All other
+domains use the universal lower bound `(0, 1)`; every proof either contains a
+primitive or at least one inference. Heuristic computation also consumes budget.
+
+After all universe generation and rule activation finish, search may stop when
+every goal has a witness and the cheapest queued proof costs strictly more than
+every goal witness. Positive inference costs ensure that such remaining work
+cannot improve those goals or add equal-cost alternatives. If a goal is missing,
+the proof relation must instead reach its full fixed point before failure is certified.
+
 Termination follows from a finite universe, nonnegative integer costs,
 positive rule costs, and a finite number of retained alternatives.
 The fixed point gives the minimum cost for every admitted derivable pair.

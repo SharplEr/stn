@@ -1,0 +1,280 @@
+// Architecture of the incremental bounded proof search implemented in src/search.
+// Validate this design with:
+// cargo run --release -- examples/proof-search-incremental.stypes --max-steps 10000000
+//
+// The logical interfaces below describe data flow, not a required Rust representation.
+// Store IDs remain stable; ownership, borrowing, and mutation are implementation choices.
+// Loops and dispatch are explicit operations: STN does not infer effect sequencing.
+//
+// Design invariants:
+// - Search only DEFINITIONS; FEATURES are goals and never become available morphisms.
+// - Preserve the relevant/exhaustive universes and inference rules from doc.md.
+// - Minimize (primitive occurrences, inference occurrences) lexicographically.
+// - Count occurrences in the unfolded proof tree, even when storage shares DAG nodes.
+// - A smaller concrete universe provides witnesses, not global lower bounds.
+// - Unknown heuristic cases use a zero function-count bound, never an unsupported positive estimate.
+// - New types/rules may improve old pairs; processed pairs are not permanently closed.
+// - Failure requires complete universe generation and proof saturation.
+//
+// Research basis: weighted AND/OR derivations and admissible abstractions.
+// https://home.ttic.edu/~dmcallester/jair07.pdf
+// https://cs.uky.edu/~sgware/reading/papers/bonet2001planning.pdf
+// This first design uses conservative incremental relaxation. A*LD-style context
+// estimates can later improve scheduling without changing certification contracts.
+
+DEFINITIONS:
+
+/// Checked declarations, owning semantic types, ground primitives, ordered ground goals,
+/// source metadata, and the tuple-arity bound inferred during elaboration.
+Specification
+
+/// Validated profile, intermediate-depth and tuple-arity bounds, type/work limits,
+/// and the positive alternative cap. The cap remains applicable to every type pair.
+ValidationOptions
+
+SearchRequest = (Specification, ValidationOptions)
+
+/// Stable identifier of an interned semantic type; allocation does not admit it to search.
+TypeId
+
+/// Stable identifier of an original typed witness in the shared proof DAG.
+ProofId
+
+/// Canonical composition key using exactly the equivalences in doc.md section 8.1.
+NormalFormId
+
+/// Ground goal endpoints; its source declaration and substitutions remain in the plan.
+GroundGoal = (TypeId, TypeId)
+
+/// Nonnegative number of primitive occurrences in an unfolded proof tree.
+FunctionCount
+
+/// Nonnegative number of inference occurrences in an unfolded proof tree.
+InferenceCount
+
+Cost = (FunctionCount, InferenceCount)
+
+/// A certified lexicographic lower bound on the minimum cost in the full selected domain.
+/// A function-only lower bound L can safely become (L, 0).
+/// For L >= 1, binary/unary rules also imply at least L - 1 inference occurrences.
+CostBound = Cost
+
+/// Resource counters shared by initialization, heuristic construction, generation,
+/// rule activation, normalization, propagation, certification, and witness checking.
+SearchUsage
+
+/// Type capacity or work budget exhausted; includes the stage and consumed counters.
+SearchLimit
+
+/// Immutable definition of the complete selected search domain and its lazy generators.
+/// Relevant mode uses the existing elementary-transformation closure, not arbitrary tuples.
+/// Exhaustive mode additionally enumerates bounded constructors and normalized nonempty sums.
+/// Explicit shapes remain admitted regardless of synthesis depth; existential packages
+/// have no implicit packing/unpacking rules, and nominal construction remains forbidden.
+/// Admission is decidable without first materializing every member of the domain.
+UniversePlan
+
+/// Small optimistic deduction model covering the full planned domain, including types
+/// that have not yet been generated. Every concrete inference must have an abstract
+/// simulation costing no more than it; relaxed paths are never emitted as witnesses.
+/// First version: h_max for relevant domains containing only opaque types, products,
+/// and nominal views, with zero-cost optimistic structural steps.
+/// Any unsupported constructor anywhere in the domain, or the exhaustive profile,
+/// disables positive function-count bounds. Use the universal proof bound (0,1) instead.
+/// For (X,Y) -> Z, combine prerequisites with max, then add the primitive cost.
+/// Do not sum independent component estimates: one producer can return both components.
+/// A covered goal may have a cheaper path through an uncovered rule; checking just
+/// the goal's endpoints is insufficient to enable a positive estimate.
+/// Require an admissibility argument for each supported rule before using a positive bound.
+RelaxedModel
+
+/// Cached certified lower bounds for all ground goals in the full selected domain.
+/// Bounds depend on the plan and declarations, not on the currently generated subset.
+LowerBounds:
+    estimate: GroundGoal -> CostBound
+
+/// Owning planning context: declarations, options, domain plan, lower bounds,
+/// source metadata, and already charged usage. No concrete proof search has run yet.
+SearchPlan:
+    /// Admit explicit types and views, seed primitives and structural rules, and enqueue
+    /// domain generators. Unsupported or expensive heuristic cases may use zero bounds.
+    /// All admitted type IDs and original witness IDs are stable for the entire session.
+    seed: () -> SearchState | SearchLimit
+
+/// Consume the request, establish the domain plan, build a budgeted relaxed model,
+/// and cache certified goal bounds. This stage does not eagerly close the concrete universe.
+prepareSearch: SearchRequest -> SearchPlan | SearchLimit
+
+/// One suspended finite-domain generator or one new type/context/elementary-transform join.
+/// Its cursor records progress so resuming it does not rescan processed combinations.
+TypeTask
+
+/// Newly admitted types and elementary transformations; identities are deduplicated.
+/// The owning state schedules their structural seeds and all newly applicable joins.
+UniverseDelta
+
+/// Generated prefix of the exact planned universe, owning type-admission membership,
+/// pending generator cursors, and deduplicated elementary-transformation dependencies.
+IncrementalUniverse:
+    /// Perform one bounded generation batch. Relevant closure joins each new type/context
+    /// with existing transforms, and each new transform with existing contexts, once.
+    /// Exhaustive generation resumes constructor cursors subject to the original bounds.
+    /// A derived general proof never enlarges the relevant profile's domain definition.
+    expand: TypeTask -> UniverseDelta | SearchLimit
+
+/// New endpoint, structural seed, or newly enabled inference relationship to index.
+RuleTask
+
+/// New inference relationships and seed witnesses enabled by admitted endpoints.
+RuleDelta
+
+/// Incremental indices for exact composition endpoints, same-input fanout branches,
+/// admitted binary products, collection lifts, restrictions, sum extensions, and narrowing.
+/// Deduplicate concrete relationships and join only newly available dependencies.
+RuleIndex:
+    /// Activate applicable relationships. If their premises already have witnesses,
+    /// enqueue their conclusions immediately; do not wait for premises to change again.
+    /// Admission and inference applicability use the unchanged rules from doc.md.
+    activate: RuleTask -> RuleDelta | SearchLimit
+
+/// A newly accepted original witness and the relationship updates it must trigger.
+/// Queued references carry the pair's cost revision so stale work can be discarded safely.
+ProofTask
+
+/// Accepted cost improvements or new equal-cost normalized representatives, together
+/// with the consequences and certification attempts that now need scheduling.
+ProofDelta
+
+/// Best currently known costs and up to the configured cap of original witnesses per pair.
+/// Normalize only for deduplication; retain and charge the original checked witness tree.
+/// A lower cost replaces the active representatives and advances the pair revision.
+/// An equal cost is accepted only for a new normalized key while capacity remains.
+/// Higher-cost witnesses and duplicates do not propagate. Old immutable DAG nodes remain
+/// valid evidence even when their pair's active representatives have been replaced.
+ProofRelation:
+    /// Join the new witness with currently active premises through applicable rules.
+    /// Composition adds child costs; fanout adds both branch costs; every inference adds one.
+    /// Reopen every improved pair and propagate the improvement to its consequences.
+    /// Equal-cost new representatives also propagate while respecting the per-pair cap.
+    propagate: ProofTask -> ProofDelta | SearchLimit
+
+/// A request to inspect one goal's best witnesses, full-domain lower bound,
+/// retained normalized alternatives, and any available exhaustion evidence.
+CertificationRequest
+/// Checked original witnesses of equal minimum cost, with their goal and certificate.
+CertifiedGoal
+/// This goal has no derivation in the selected fully generated and saturated domain.
+UnresolvableGoal
+/// No certificate is available yet; valid provisional witnesses may still exist.
+NotCertified
+CertificationDecision = CertifiedGoal | UnresolvableGoal | NotCertified
+
+/// Certificates relate witnesses to the full planned domain, never just the generated prefix.
+CertificateChecker:
+    /// Independently check candidate witnesses and their original costs.
+    /// Certify a minimum when its full lexicographic cost equals a certified lower bound,
+    /// or after full domain generation/activation, when all queued proof costs exceed
+    /// every goal's best witness cost. Every inference costs strictly more than its premises.
+    /// Function-count equality alone does not certify the inference-count tie breaker.
+    /// Certify failure only at that full fixed point with no witness for the goal.
+    certify: CertificationRequest -> CertificationDecision | SearchLimit
+
+/// Reconsider a goal after a witness change, a stronger certified bound, or global exhaustion.
+CertificateTask
+/// Work shared across all goals. Every admitted delta schedules all consequences needed
+/// for completeness; finishing a goal does not remove premises needed by other goals.
+WorkItem = TypeTask | RuleTask | ProofTask | CertificateTask
+
+/// Deterministic scheduling preference, not evidence that remaining proofs are expensive.
+/// Order proof tasks by cost. Before generation completes, defer tasks whose cost exceeds
+/// every goal bound: they cannot finish a goal early and new types may enable cheaper paths.
+/// Periodically resume generators to avoid starvation, preserving expensive tasks for later.
+/// Goal relevance may reorder work; it must not discard a task without a sound pruning argument.
+WorkPriority
+
+/// Pending generator, rule, proof, and certificate tasks with deduplication and resumable cursors.
+/// Stable tie breaking follows declaration order and semantic structure, not hash iteration.
+/// Empty proof work alone is not exhaustion: generation and activation must also finish.
+WorkQueue:
+    /// Assign a scheduling preference. In this first version, heuristic priorities are
+    /// allowed to be inconsistent because improved pairs can be reopened.
+    /// No minimum certificate is obtained merely by looking at the smallest queue priority.
+    prioritize: WorkItem -> WorkPriority
+
+/// Original typed proof DAG, normalized-key index, and an independent witness checker.
+/// Search-local indices can be discarded after final roots have been selected.
+ProofStore
+
+/// Ordered per-goal records of provisional witnesses, certified minima, and alternatives.
+/// A goal with a certified minimum is finished early once the alternative cap is filled.
+/// If fewer alternatives are found, finish generation and propagate through all goal witness
+/// costs. Pending strictly more expensive proofs cannot add another equal-cost alternative.
+/// Goals lacking witnesses require full saturation before failure can be certified.
+/// Already certified witnesses remain usable evidence; goal declarations never become primitives.
+GoalProgress
+
+/// Owning live session: plan, usage, incremental universe, rule index, proof relation,
+/// work queue, proof store, goal progress, lower bounds, and certificate checker.
+SearchState:
+    /// If every goal is finished, return a completed search without generating unused types.
+    /// Otherwise select a pending task, retaining the state with it in ReadyWork.
+    /// When all work is exhausted, request final certification and finish only after
+    /// every goal has a minimum certificate or a domain-relative failure certificate.
+    /// A terminal outcome is wrapped in IterationResult, preserving counters and owned stores.
+    next: () -> ReadyWork | IterationResult
+
+    /// Explicit iterative driver: repeatedly call next and execute each ReadyWork,
+    /// inspect the resulting IterationResult, and resume with its SearchState or return
+    /// its completed/interrupted outcome. All context travels with the selected branch.
+    /// This loop is implemented directly; its behavior is not inferred by STN.
+    /// Finite admission, positive inference costs, best-cost replacement, and finite
+    /// alternative caps ensure termination when resource limits allow full saturation.
+    run: () -> CompletedSearch | InterruptedSearch
+
+/// Owning result of one scheduler iteration, including the case where selection was terminal.
+/// Its nominal distinction prevents identity or a full run from proving that this step ran.
+IterationResult:
+    /// Explicit outcome dispatch: expose the next loop state or the terminal owned session.
+    inspect: () -> SearchState | CompletedSearch | InterruptedSearch
+
+/// Selected task together with its owning state; dispatch retains all context across effects.
+ReadyWork:
+    /// Dispatch on WorkItem. Expand types, activate rules, propagate a witness, or certify a goal;
+    /// apply the returned delta to the owning state and enqueue every newly enabled consequence.
+    /// Stage-local SearchLimit becomes an interrupted IterationResult with the owned context.
+    /// This operation includes explicit sum dispatch and context retention.
+    execute: () -> IterationResult
+
+/// Finished session with independently checked goal outcomes and complete ownership of evidence.
+/// Completion means all requested goals are certified, not necessarily that the universe is full.
+CompletedSearch
+/// Interrupted session with counters, reason, owning stores, and provisional/certified progress.
+/// First version preserves the current public behavior: interruption reports every goal
+/// incomplete. Internally certified witnesses do not silently become an uncertified PROVED result.
+InterruptedSearch
+
+/// Final owning result compatible with the existing report pipeline: ordered goals/statuses,
+/// options and tuple bound, type store, compacted original proof DAG, and usage counters.
+SearchResult
+
+/// Convert an initialization limit into the existing incomplete-result contract while retaining
+/// all ground goal metadata and options needed for the report, even before the session exists.
+/// SearchLimit carries this reporting context whenever it escapes preparation or seeding.
+preparationFailed: SearchLimit -> InterruptedSearch
+
+/// Explicit outcome dispatch. Preserve certificates and statuses on completion; on interruption
+/// produce incomplete statuses. Select final roots, compact the DAG, and discard transient indices.
+/// Every unit of final checking/compaction work is budgeted; exhaustion yields an incomplete result.
+finishSearch: CompletedSearch | InterruptedSearch -> SearchResult
+
+FEATURES:
+
+/// Plan and seed a search without materializing the full concrete universe.
+initializeSearch: SearchRequest -> SearchState | InterruptedSearch
+
+/// One complete scheduler iteration, carrying completion/interruption without losing context.
+advanceSearch: SearchState -> IterationResult
+
+/// Consume the checked specification and options and produce the existing owning search result.
+/// Errors in parsing/elaboration occur before this input; resource exhaustion is a result status.
+search: SearchRequest -> SearchResult

@@ -126,6 +126,34 @@ Within that fixed universe, the search applies **all** inference rules from
 restriction of derived inputs, and extension of derived morphisms over sums.
 Every reported witness is checked independently against the declarations.
 
+The universe is generated incrementally. Resumable cursors enumerate exhaustive
+constructors; the relevant profile joins only new contexts and elementary
+transformations. Rule activation also applies new relationships to existing
+witnesses. A cheaper path reopens its type pair, including when only the inference
+count improves. Composition and fanout reject entire families of equal-cost
+alternatives when their cost cannot improve the result pair.
+
+For a relevant domain containing only opaque types, products, and their nominal
+views, an optimistic `h_max` relaxation computes lower bounds on primitive counts.
+It treats structural steps as free and combines product prerequisites by maximum,
+so a shared producer is not counted twice. Any unsupported constructor anywhere
+in the domain, or the exhaustive profile, disables these positive function-count
+bounds; the universal proof bound `(0, 1)` remains available. Bound computation
+uses the declarations, independently of the generated domain prefix.
+
+A bound match certifies an early minimum only for the full lexicographic cost;
+early completion also requires filling the requested alternative cap. While types
+are still being generated, proof work too expensive to attain any goal bound is
+deferred. Once generation finishes, positive inference costs allow stopping after
+all candidates through every goal's best cost have been processed. A missing goal
+requires exhausting the proof relation. This preserves certification without
+having to propagate all more expensive proofs.
+
+Final witness checking shares a visited set across roots. Checking and DAG
+compaction also consume the work budget; interruption at either stage reports
+every goal as incomplete. The architecture is described in
+[proof-search-incremental.stypes](examples/proof-search-incremental.stypes).
+
 Minimum cost is certified **within the selected universe**. A failure in the
 default profile is `UNRESOLVABLE_IN_RELEVANT_UNIVERSE`, not a claim about the
 complete depth-bounded grammar. Naming a missing intermediate shape can extend

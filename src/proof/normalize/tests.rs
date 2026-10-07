@@ -76,7 +76,11 @@ impl Evidence {
         output: TypeId,
         children: Vec<ProofId>,
     ) -> ProofId {
-        self.insert(self.proofs.inference(input, output, rule, children))
+        self.insert(
+            self.proofs
+                .inference(input, output, rule, children)
+                .unwrap(),
+        )
     }
 
     fn compose(&mut self, first: ProofId, second: ProofId) -> ProofId {

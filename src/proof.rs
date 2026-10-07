@@ -141,29 +141,44 @@ impl ProofStore {
 
     /// Store a record as supplied, reusing an identifier for an equal record.
     /// Children must refer to this store. This does not check inference semantics
-    /// or costs. Search checks its results through `Self::check_against`; unit
+    /// or costs. Search checks its results through `Self::check_roots`; unit
     /// tests can also recheck edited external witnesses with the test-only `check`.
     pub fn insert(&mut self, proof: Proof) -> ProofId {
         ProofId(self.nodes.insert_full(proof).0)
     }
 
-    /// Validate a witness using already resolved declarations in the same type store.
-    /// Search uses this entry point without parsing or translating its own graph.
-    /// The checker visits shared premises once and rejects cycles and invalid costs.
+    /// Test helper for checking a single witness without a search work budget.
+    #[cfg(test)]
     pub(crate) fn check_against(
         &self,
         root: ProofId,
         primitives: &[Primitive],
         types: &TypeStore,
     ) -> Result<(), String> {
-        ProofChecker {
+        self.check_roots([root], primitives, types, || Ok(()))
+    }
+
+    /// Check all final roots with one visited set, charging each distinct DAG node once.
+    /// The caller supplies budget accounting; the checker remains independent of search.
+    pub(crate) fn check_roots(
+        &self,
+        roots: impl IntoIterator<Item = ProofId>,
+        primitives: &[Primitive],
+        types: &TypeStore,
+        charge: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut checker = ProofChecker {
             proofs: self,
             primitives,
             types,
             visiting: HashSet::new(),
             visited: HashSet::new(),
+            charge,
+        };
+        for root in roots {
+            checker.visit(root)?;
         }
-        .visit(root)
+        Ok(())
     }
 
     /// Build an inference candidate, counting each child occurrence in its cost.
@@ -175,31 +190,41 @@ impl ProofStore {
         output: TypeId,
         rule: Rule,
         children: Vec<ProofId>,
-    ) -> Proof {
+    ) -> Result<Proof, String> {
         let mut cost = Cost {
             functions: 0,
             rules: 1,
         };
         for &child in &children {
-            cost.functions += self[child].cost.functions;
-            cost.rules += self[child].cost.rules;
+            cost.functions = cost
+                .functions
+                .checked_add(self[child].cost.functions)
+                .ok_or("proof cost exceeds the representable range; search is incomplete")?;
+            cost.rules = cost
+                .rules
+                .checked_add(self[child].cost.rules)
+                .ok_or("proof cost exceeds the representable range; search is incomplete")?;
         }
-        Proof {
+        Ok(Proof {
             input,
             output,
             cost,
             node: ProofNode::Inference { rule, children },
-        }
+        })
     }
 
     /// Keep reported roots and their reachable premises, rebuilding dense indices.
     /// Search-created nodes are topological: all children precede their parents.
     /// Both root identifiers and child references are remapped; all other search
     /// candidates are discarded. Shared premises remain single stored records.
-    pub(crate) fn retain_roots(&mut self, roots: &mut [ProofId]) {
+    pub(crate) fn retain_roots(
+        &mut self,
+        roots: &mut [ProofId],
+        mut charge: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         if roots.is_empty() {
             *self = Self::default();
-            return;
+            return Ok(());
         }
         let mut marked = vec![false; self.nodes.len()];
         let mut pending = roots.to_vec();
@@ -207,6 +232,7 @@ impl ProofStore {
             if marked[id.0] {
                 continue;
             }
+            charge()?;
             marked[id.0] = true;
             if let ProofNode::Inference { children, .. } = &self[id].node {
                 pending.extend_from_slice(children);
@@ -216,6 +242,7 @@ impl ProofStore {
         let mut mapping = vec![None; old.nodes.len()];
         // Move surviving records in insertion order, remapping children before parents.
         for (index, mut proof) in old.nodes.into_iter().enumerate() {
+            charge()?;
             if !marked[index] {
                 continue;
             }
@@ -229,6 +256,7 @@ impl ProofStore {
         for root in roots {
             *root = mapping[root.0].expect("reported root is marked");
         }
+        Ok(())
     }
 }
 
@@ -361,7 +389,7 @@ pub(crate) fn unary_valid(
 
 /// State for independently checking one root and its reachable proof DAG.
 /// Source graphs stay immutable; active and completed marks belong to this check.
-struct ProofChecker<'a> {
+struct ProofChecker<'a, F> {
     /// Proof graph owning the root and all premise identifiers.
     proofs: &'a ProofStore,
     /// Resolved user morphisms against which primitive metadata is checked.
@@ -372,15 +400,18 @@ struct ProofChecker<'a> {
     visiting: HashSet<ProofId>,
     /// Nodes whose rules, source metadata, and unfolded costs have been checked.
     visited: HashSet<ProofId>,
+    /// Work accounting injected by the caller, independent of semantic rule checking.
+    charge: F,
 }
 
-impl ProofChecker<'_> {
+impl<F: FnMut() -> Result<(), String>> ProofChecker<'_, F> {
     /// Check children before their parent, visiting shared premises only once.
     /// Validate rule arity, endpoints, primitive metadata, and checked cost sums.
     fn visit(&mut self, id: ProofId) -> Result<(), String> {
         if self.visited.contains(&id) {
             return Ok(());
         }
+        (self.charge)()?;
         if !self.visiting.insert(id) {
             return Err("proof contains a cycle".into());
         }

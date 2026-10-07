@@ -88,7 +88,7 @@ pub enum FeatureStatus {
         /// A bounded sample of outputs reachable from the feature input.
         reachable: Vec<TypeId>,
     },
-    /// A resource limit or failed witness check prevensourceted certification.
+    /// A resource limit or failed witness check prevented certification.
     SearchIncomplete {
         /// The condition that prevented the search from completing.
         reason: String,
@@ -116,7 +116,8 @@ pub struct SearchUsage {
     /// Distinct types counted against the universe cap, up to its configured limit.
     /// Includes collected explicit types even if universe construction is interrupted.
     pub types: usize,
-    /// Work units consumed by universe construction, rule preparation, and proof search.
+    /// Work units consumed by bounds, generation, rule activation, proof search,
+    /// independent witness checking, and final DAG compaction.
     /// A failed attempt after exhaustion does not consume an additional unit.
     pub steps: usize,
 }
