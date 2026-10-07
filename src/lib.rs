@@ -15,7 +15,7 @@ use std::{fmt, num::NonZeroUsize};
 pub struct ValidationOptions {
     /// Maximum nesting depth of synthesized anonymous collections and products.
     pub max_depth: usize,
-    /// Positive maximum of distinct equal-minimum-cost proofs retained per pair.
+    /// Positive maximum of normalized equal-minimum-cost alternatives retained per pair.
     pub max_proofs: NonZeroUsize,
     /// Positive maximum of types admitted to the search universe.
     pub max_types: NonZeroUsize,
@@ -78,7 +78,7 @@ impl From<syntax::ParseError> for ValidationError {
 pub enum FeatureStatus {
     /// Minimum cost within the selected finite universe, independently checked.
     Proved {
-        /// Retained distinct witnesses, all with the same minimum cost.
+        /// Original witnesses with distinct normalized compositions, all at minimum cost.
         proofs: Vec<ProofId>,
     },
     /// The selected universe was exhausted without a derivation of the goal.
@@ -139,8 +139,8 @@ impl ValidationReport {
     }
 }
 impl fmt::Display for ValidationReport {
-    /// Render goal signatures, certified proof costs, and profile-specific failure
-    /// statuses using the report's owning stores to resolve all node identifiers.
+    /// Render function compositions and certified costs for proved goals. Keep type
+    /// signatures in failure diagnostics, where they explain the missing transformation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Semantic Types Notation: {}", self.source_name)?;
         writeln!(
@@ -166,13 +166,17 @@ impl fmt::Display for ValidationReport {
         for feature in &self.features {
             writeln!(
                 f,
-                "\n{}:{}: {}: {} -> {}",
-                self.source_name,
-                feature.line,
-                feature.name,
-                self.types.display(feature.input),
-                self.types.display(feature.output)
+                "\n{}:{}: {}",
+                self.source_name, feature.line, feature.name
             )?;
+            if !matches!(feature.status, FeatureStatus::Proved { .. }) {
+                writeln!(
+                    f,
+                    "  goal: {} -> {}",
+                    self.types.display(feature.input),
+                    self.types.display(feature.output)
+                )?;
+            }
             match &feature.status {
                 FeatureStatus::Proved { proofs } => {
                     writeln!(
@@ -180,15 +184,7 @@ impl fmt::Display for ValidationReport {
                         "  PROVED ({} minimum-cost witness(es) in the selected universe)",
                         proofs.len()
                     )?;
-                    for p in proofs {
-                        writeln!(
-                            f,
-                            "  [{}, {}] {}",
-                            self.proofs[*p].cost.functions,
-                            self.proofs[*p].cost.rules,
-                            self.proofs.expression(*p, &self.types)
-                        )?;
-                    }
+                    self.proofs.write_alternatives(f, &feature.name, proofs)?;
                 }
                 FeatureStatus::UnresolvableWithinUniverse { reason, reachable } => {
                     writeln!(

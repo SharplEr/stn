@@ -185,10 +185,10 @@ Built-in names cannot be redeclared.
 | Float32, Float64 | Floating-point values with the indicated contract width. |
 | None | A singleton type with the sole value None, representing absence. |
 | String | A string, without a prescribed encoding or physical representation. |
-| Bytes | A predefined type whose structural description is List<Byte>. |
-| List<T> | A finite sequence; order and repetitions matter. |
-| Set<T> | A finite set. |
-| Map<K, V> | A finite partial mapping from K to V. |
+| Bytes | A predefined type whose structural description is `List<Byte>`. |
+| `List<T>` | A finite sequence; order and repetitions matter. |
+| `Set<T>` | A finite set. |
+| `Map<K, V>` | A finite partial mapping from K to V. |
 
 Byte, UInt8, and Int8 are different types. No implicit numeric conversion,
 widening, or shared-representation conversion is provided.
@@ -197,7 +197,7 @@ None is different from `()`. Absence and successful completion without
 returned components have different meanings, despite both having one value.
 
 **Proposed:** Bytes follows the ordinary nominal-definition rule and is not
-a transparent alias. It has the same structural view as List<Byte>, but its
+a transparent alias. It has the same structural view as `List<Byte>`, but its
 nominal identity is preserved.
 
 **Open, without affecting parser or proof search:** specify whether Float32
@@ -214,7 +214,7 @@ Order = ASC | DESC
 
 The equals sign introduces a new nominal type with a structural description,
 not a transparent alias. If `A = Set<DocId>` and `B = Set<DocId>`, A, B,
-and the anonymous Set<DocId> are distinct types.
+and the anonymous `Set<DocId>` are distinct types.
 
 Two separate operations are required in a validator:
 
@@ -224,14 +224,14 @@ Two separate operations are required in a validator:
    when applying a specified structural rule.
 
 Shape inspection does not replace nominal identity throughout the type system.
-An arbitrary Set<DocId> is not automatically a MatchedDocs value.
+An arbitrary `Set<DocId>` is not automatically a MatchedDocs value.
 
 **Confirmed:** structural inference may produce a nominal collection result.
 For example, with `Scores = Set<Score>` and `score: DocId -> Score`,
 mapping may prove `MatchedDocs -> Scores`.
 
 **Confirmed:** structural conversion is directed: MatchedDocs may be viewed as
-Set<DocId>, but an arbitrary Set<DocId> cannot automatically become MatchedDocs.
+`Set<DocId>`, but an arbitrary `Set<DocId>` cannot automatically become MatchedDocs.
 No nominal constructor is implicitly available. Identity preserves the exact
 input type, including its nominal name. Section 7.7 specifies a separate lifting
 rule for transformations between nominal collections; it is not view conversion
@@ -291,7 +291,7 @@ for set elements and map keys; its implementation is outside STN.
 
 Mapping a set may merge equal results. Map-value mapping preserves keys and
 their associations. There is no general implicit covariance:
-List<A> is not automatically List<A | B>.
+`List<A>` is not automatically `List<A | B>`.
 
 ### 4.7 Finite parameters
 
@@ -588,8 +588,8 @@ mapValues(f): Map<K, A> -> Map<K, B>
 The informal name map covers both mapList and mapSet. Map values are
 transformed without changing keys.
 
-If `f: A -> B | Error`, mapping a list produces List<B | Error>.
-It does not produce List<B> | Error.
+If `f: A -> B | Error`, mapping a list produces `List<B | Error>`.
+It does not produce `List<B> | Error`.
 
 ### 7.4 List flat mapping
 
@@ -700,11 +700,11 @@ a general constructor, use this **proposed precise lifting profile**:
    definitions are not recursively erased.
 
 Thus map(score) may prove MatchedDocs -> Scores because its input and output
-are nominal collections and Set<DocId> changes to Set<Score>.
-It may also prove MatchedDocs -> Set<Score>.
-From an anonymous Set<DocId>, it proves Set<Score>, not Scores.
-Map(identity) cannot construct MatchedDocs from Set<DocId> or rename an existing
-nominal Set<DocId> wrapper.
+are nominal collections and `Set<DocId>` changes to `Set<Score>`.
+It may also prove `MatchedDocs -> Set<Score>`.
+From an anonymous `Set<DocId>`, it proves `Set<Score>`, not Scores.
+Map(identity) cannot construct MatchedDocs from `Set<DocId>` or rename an existing
+nominal `Set<DocId>` wrapper.
 
 For flatMap, inspect or explicitly view a nominal list result of the element
 morphism as needed. The witness proof must retain any view step; it is not
@@ -717,7 +717,7 @@ constructor E -> N. A declared primitive that returns N can still establish
 such a result explicitly.
 
 Additional prose invariants are not proved by structural lifting. For example,
-matching a List<Score> shape does not prove that it is sorted. Declare a
+matching a `List<Score>` shape does not prove that it is sorted. Declare a
 dedicated function when an invariant needs an explicit implementation obligation.
 
 **Proposed:** nominal products can be inspected by projection, but the binary
@@ -768,14 +768,97 @@ Finite specialization adds no rule cost. A restriction node adds (0, 1).
 
 A DAG may share proof storage, but its cost is that of the unfolded tree.
 
-For each feature specialization, return a minimum-cost proof and at most
-maxAlternatives equal-cost alternatives. maxAlternatives is a positive integer.
+For each feature specialization, return at most maxAlternatives representatives
+of distinct normalized compositions, all at the minimum proof cost.
+maxAlternatives is a positive integer and includes the first representative.
 Do not include higher-cost proofs merely to fill the limit.
 
-**Proposed:** alternatives are structurally distinct proof trees, deduplicated
-by primitive identities, rule kinds, substitutions, types, and children.
-Composition associativity and other categorical equations do not identify
-different trees. Use a stable ordering when truncating alternatives.
+### 8.1 Normalized alternatives
+
+The equivalence key of a proof is a typed, normalized composition. Normalize
+premises first, then the enclosing operation. Retain input and output types,
+expanded primitive identities (including parameter substitutions), rule kinds
+and arguments, and the order and multiplicity of premises. Anonymous sums in
+keys obey the ordinary sum normalization; nominal types retain their identity.
+
+Use only the following normalization rules:
+
+1. Flatten composition into an ordered sequence. Thus `(f >>> g) >>> h` and
+   `f >>> (g >>> h)` have the same key. Here `>>>` denotes composition in
+   execution order, as in the human-readable proof output.
+2. Remove an extension whose input is already exactly its premise's input.
+   For a valid extension its output is then unchanged as well.
+3. Fuse `extend[S](extend[A](f))` into `extend[S](f)` when A is an anonymous
+   sum. Keep the outer source S, including its nominal identity. Do not fuse
+   through a nominal A: the inner extension may inspect that nominal wrapper.
+4. Distribute an extension over a normalized pipeline only under the
+   pass-through condition below. Normalize each resulting extension and
+   flatten the resulting pipeline again.
+
+In rules 2–4, `extend[S](p)` abbreviates `extendSum[S,input(p)](p)` from
+Section 7.2.1; the shorter spelling is used only to describe normalization.
+
+For a pipeline `p1 >>> ... >>> pn` extended to source S, define
+
+~~~text
+R = sourceVariants(S) \ handled(input(p1))
+~~~
+
+For every later step pi, at least one of these conditions must hold:
+
+- `R` is disjoint from `handled(input(pi))`; or
+- pi is itself an extension `extend[U](q)`, U is an anonymous sum, and R is
+  disjoint from `handled(input(q))`.
+
+The second case allows an overlapping variant that the step already passes
+through unchanged. It does not apply to a nominal U, whose wrapper would be
+inspected rather than passed through as a value of U.
+
+When all later steps satisfy this condition, the normalized key is:
+
+~~~text
+extend[S](p1)
+>>> extend[input(p2) | R](p2)
+>>> ...
+>>> extend[input(pn) | R](pn)
+~~~
+
+If any later step fails the condition, keep the extension around the whole
+pipeline. For example, when `f: A -> B | Error` and
+`g: B | Error -> C | Error`, these must remain distinct:
+
+~~~text
+extend[A | Error](f >>> g)
+extend[A | Error](f) >>> g
+~~~
+
+The first passes an original Error unchanged; the second sends it to g.
+Both have the same endpoints and may have the same proof cost. When instead
+`g: B -> C`, the following keys do coincide:
+
+~~~text
+extend[A | Error](f >>> extend[B | Error](g))
+extend[A | Error](f) >>> extend[B | Error](g)
+~~~
+
+Fanout is neither flattened nor reordered. Projections, narrowing, collection
+lifts, input restrictions, and nominal views retain their explicit structure.
+Normalize their premises recursively, without adding other algebraic laws.
+Equality of function-name sets, printed expressions, or output types alone
+does not establish equality of normalized compositions.
+
+Normalization selects representatives; it does not rewrite the evidence or
+its cost. Retain an original, independently checked proof tree for each key.
+Virtual sum boundaries introduced while computing a key do not enlarge the
+search universe and need not be admissible intermediate types. They are never
+used as new derivations. The cost is always that of the retained original tree,
+even if normalization changes the number of operations in its key.
+
+Apply this criterion during search, before duplicates can consume the
+alternative limit for a type pair. On equal cost and equal key, retain the
+first candidate in deterministic discovery order. On a lower cost, replace
+the pair's previous alternatives. This is deliberately a limited normalization
+procedure, not a decision procedure for all semantic equivalences.
 
 Two paths ending in D establish the same semantic output type, not equality
 of values, effects, or implementations. STN does not require diagrams to commute.
@@ -881,7 +964,8 @@ specializations; exceeding this guard is EXPANSION_LIMIT, a resource outcome.
 ### 9.3 Saturation algorithm
 
 Intern types to stable IDs. For every pair (A, B) in U × U, maintain the best
-known cost and up to maxAlternatives proof trees for A -> B.
+known cost and up to maxAlternatives original proof representatives with
+distinct normalized keys from Section 8.1 for A -> B.
 
 Seed the relation with:
 
@@ -904,7 +988,8 @@ repeat
     apply admitted input restrictions
 
     replace a pair's entry when a candidate has lower cost
-    merge distinct proofs on equal cost, then truncate deterministically
+    on equal cost, discard the candidate if its normalized key is already retained
+    retain a new key and its original witness if the alternative limit permits
 until no entry changes
 ~~~
 
@@ -914,7 +999,8 @@ primitive declarations separately from the truncated proof relation.
 Termination follows from a finite universe, nonnegative integer costs,
 positive rule costs, and a finite number of retained alternatives.
 The fixed point gives the minimum cost for every admitted derivable pair.
-Alternative truncation does not enumerate all globally possible proofs.
+Alternative truncation does not enumerate all globally possible normalized
+compositions. Equivalent trees do not occupy separate alternative slots.
 
 The validator should independently check every emitted proof tree: matching
 types, substitutions, subset premises, allowed nominal lifting, and total cost.
@@ -1089,7 +1175,7 @@ f: A | B -> Y
 FEATURES:
 ~~~
 
-Reject the document. The specialization f<A> and the last declaration both
+Reject the document. The specialization `f<A>` and the last declaration both
 accept A. Their different output types do not resolve the ambiguity.
 
 ## 12. Remaining decisions
@@ -1110,7 +1196,8 @@ conventions for:
 4. The exact depth/arity conventions and default search limits.
 5. Lexical syntax, forward references, parameter scopes, and exclusion of recursion.
 6. Built-in Bytes nominality and the precise floating-point value domains.
-7. Structural proof-tree alternatives and costs of the added structural rules.
+7. Costs of the added structural rules; normalized alternatives are specified
+   in Section 8.1.
 
 Implementations must record their chosen profile. They must not import implicit
 conversions or equality from their implementation language to fill these gaps.

@@ -2,7 +2,7 @@
 use crate::{
     FeatureReport, FeatureStatus, Type, TypeId, TypeStore, ValidationOptions, ValidationReport,
     model::{Primitive, Specification},
-    proof::{self, Cost, Proof, ProofId, ProofStore, Rule},
+    proof::{self, Cost, NormalForms, NormalId, Proof, ProofId, ProofStore, Rule},
 };
 use indexmap::IndexSet;
 use std::{
@@ -337,14 +337,16 @@ struct Agenda<'a> {
     proofs: &'a mut ProofStore,
     /// Work allowance remaining after universe construction.
     budget: Budget,
-    /// Maximum distinct alternatives offered at the best cost for each pair.
+    /// Maximum normalized alternatives offered at the best cost for each pair.
     limit: usize,
     /// Minimum-cost queue; proof records live exclusively in the proof store.
     heap: BinaryHeap<Reverse<(Cost, ProofId)>>,
     /// Lowest candidate cost offered so far for each input/output type pair.
     best_offered: HashMap<Pair, Cost>,
-    /// Proof identifiers offered at each pair's best cost, checked without iteration.
-    seen: HashMap<Pair, HashSet<ProofId>>,
+    /// Normalized compositions offered at each pair's best cost.
+    seen: HashMap<Pair, HashSet<NormalId>>,
+    /// Typed equivalence keys, shared by accepted premises and new candidates.
+    normal_forms: NormalForms,
 }
 impl<'a> Agenda<'a> {
     fn new(
@@ -361,12 +363,14 @@ impl<'a> Agenda<'a> {
             heap: BinaryHeap::new(),
             best_offered: HashMap::new(),
             seen: HashMap::new(),
+            normal_forms: NormalForms::default(),
         }
     }
     /// Offer a candidate at its pair's best known cost, resetting alternatives
-    /// when a cheaper cost arrives. Reject worse, duplicate, or excess candidates
+    /// when a cheaper cost arrives. Equivalent compositions share one alternative
+    /// before the limit is applied. Reject worse, duplicate, or excess candidates
     /// before inserting records; settlement later establishes minimum costs.
-    fn offer(&mut self, pair: Pair, candidate: Proof) -> Result<(), String> {
+    fn offer(&mut self, pair: Pair, candidate: Proof, types: &TypeStore) -> Result<(), String> {
         self.budget.tick()?;
         if self
             .best_offered
@@ -387,29 +391,32 @@ impl<'a> Agenda<'a> {
         if alternatives.len() >= self.limit {
             return Ok(());
         }
-        if self
-            .proofs
-            .find(&candidate)
-            .is_some_and(|id| alternatives.contains(&id))
-        {
+        let normal = self.normal_forms.candidate(&candidate, types);
+        if !alternatives.insert(normal) {
             return Ok(());
         }
         let cost = candidate.cost;
         let id = self.proofs.insert(candidate);
-        alternatives.insert(id);
+        self.normal_forms.remember(id, normal);
         self.heap.push(Reverse((cost, id)));
         Ok(())
     }
 
     /// Construct an inference using indexed endpoints and offer it at its computed cost.
-    fn infer(&mut self, pair: Pair, rule: Rule, children: Vec<ProofId>) -> Result<(), String> {
+    fn infer(
+        &mut self,
+        pair: Pair,
+        rule: Rule,
+        children: Vec<ProofId>,
+        types: &TypeStore,
+    ) -> Result<(), String> {
         let candidate = self.proofs.inference(
             self.universe.members[pair.0],
             self.universe.members[pair.1],
             rule,
             children,
         );
-        self.offer(pair, candidate)
+        self.offer(pair, candidate, types)
     }
 
     fn pop(&mut self) -> Option<ProofId> {
@@ -716,7 +723,8 @@ impl<'a> ProofSearch<'a> {
         }
         for (id, primitive) in primitives.iter().enumerate() {
             let pair = self.universe.pair(primitive.input, primitive.output);
-            self.agenda.offer(pair, Proof::primitive(id, primitive))?;
+            self.agenda
+                .offer(pair, Proof::primitive(id, primitive), self.types)?;
         }
         Ok(())
     }
@@ -724,18 +732,23 @@ impl<'a> ProofSearch<'a> {
     /// Seed identity, the direct nominal view, and all available product projections.
     fn seed_structural(&mut self, source: usize) -> Result<(), String> {
         self.agenda
-            .infer((source, source), Rule::Identity, vec![])?;
+            .infer((source, source), Rule::Identity, vec![], self.types)?;
         let shape = self.universe.shapes[source];
         if shape != self.universe.members[source] {
             if let Some(target) = self.universe.members.get_index_of(&shape) {
-                self.agenda.infer((source, target), Rule::View, vec![])?;
+                self.agenda
+                    .infer((source, target), Rule::View, vec![], self.types)?;
             }
         }
         if let Type::Product(items) = &self.types[shape] {
             for (component, item) in items.iter().enumerate() {
                 let target = self.universe.index_of(*item);
-                self.agenda
-                    .infer((source, target), Rule::Project(component), vec![])?;
+                self.agenda.infer(
+                    (source, target),
+                    Rule::Project(component),
+                    vec![],
+                    self.types,
+                )?;
             }
         }
         Ok(())
@@ -749,7 +762,7 @@ impl<'a> ProofSearch<'a> {
         let (input, output) = (self.universe.members[pair.0], self.universe.members[pair.1]);
         for rule in [Rule::NarrowList, Rule::NarrowSet, Rule::NarrowKeys] {
             if proof::seed_valid(rule, input, output, self.types) {
-                self.agenda.infer(pair, rule, vec![])?;
+                self.agenda.infer(pair, rule, vec![], self.types)?;
             }
         }
         Ok(())
@@ -820,7 +833,7 @@ impl<'a> ProofSearch<'a> {
     fn lift_collections(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
         if let Some(lifts) = self.rules.lifts.get(&pair) {
             for &(target, rule) in lifts {
-                self.agenda.infer(target, rule, vec![proof])?;
+                self.agenda.infer(target, rule, vec![proof], self.types)?;
             }
         }
         Ok(())
@@ -829,8 +842,12 @@ impl<'a> ProofSearch<'a> {
     /// Adapt the witness to every indexed narrower input contract.
     fn restrict_input(&mut self, pair: Pair, proof: ProofId) -> Result<(), String> {
         for &source in &self.rules.restrictions[pair.0] {
-            self.agenda
-                .infer((source, pair.1), Rule::RestrictInput, vec![proof])?;
+            self.agenda.infer(
+                (source, pair.1),
+                Rule::RestrictInput,
+                vec![proof],
+                self.types,
+            )?;
         }
         Ok(())
     }
@@ -849,7 +866,7 @@ impl<'a> ProofSearch<'a> {
             );
             if let Some(target) = self.universe.members.get_index_of(&result) {
                 self.agenda
-                    .infer((source, target), Rule::ExtendSum, vec![proof])?;
+                    .infer((source, target), Rule::ExtendSum, vec![proof], self.types)?;
             }
         }
         Ok(())
@@ -860,14 +877,22 @@ impl<'a> ProofSearch<'a> {
         let (input, output) = pair;
         for &target in &self.outgoing[output] {
             for &next in &self.settled[&(output, target)] {
-                self.agenda
-                    .infer((input, target), Rule::Compose, vec![proof, next])?;
+                self.agenda.infer(
+                    (input, target),
+                    Rule::Compose,
+                    vec![proof, next],
+                    self.types,
+                )?;
             }
         }
         for &source in &self.incoming[input] {
             for &previous in &self.settled[&(source, input)] {
-                self.agenda
-                    .infer((source, output), Rule::Compose, vec![previous, proof])?;
+                self.agenda.infer(
+                    (source, output),
+                    Rule::Compose,
+                    vec![previous, proof],
+                    self.types,
+                )?;
             }
         }
         Ok(())
@@ -883,8 +908,12 @@ impl<'a> ProofSearch<'a> {
                     ((other_output, output), [other, proof]),
                 ] {
                     if let Some(&target) = self.rules.fanouts.get(&outputs) {
-                        self.agenda
-                            .infer((input, target), Rule::Fanout, children.to_vec())?;
+                        self.agenda.infer(
+                            (input, target),
+                            Rule::Fanout,
+                            children.to_vec(),
+                            self.types,
+                        )?;
                     }
                 }
             }

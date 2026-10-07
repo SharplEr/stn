@@ -134,8 +134,8 @@ fn composition_returns_only_equal_minima() {
     };
     assert_eq!(proofs.len(), 2);
     assert_ne!(
-        report.proofs.expression(proofs[0], &report.types),
-        report.proofs.expression(proofs[1], &report.types)
+        report.proofs.expression(proofs[0]),
+        report.proofs.expression(proofs[1])
     );
 }
 
@@ -241,12 +241,11 @@ fn lifts_collections_and_flatmaps_lists() {
     let FeatureStatus::Proved { proofs } = &report.features[3].status else {
         unreachable!()
     };
-    assert!(proofs.iter().any(|p| {
-        report
-            .proofs
-            .expression(*p, &report.types)
-            .starts_with("flatMap")
-    }));
+    assert!(
+        proofs
+            .iter()
+            .any(|p| { report.proofs.expression(*p).starts_with("flatMap") })
+    );
 }
 
 #[test]
@@ -501,12 +500,7 @@ fn nominal_flatmap_exposes_a_nominal_element_result_with_an_explicit_view() {
     let FeatureStatus::Proved { proofs } = &report.features[0].status else {
         unreachable!()
     };
-    assert!(
-        report
-            .proofs
-            .expression(proofs[0], &report.types)
-            .contains("view")
-    );
+    assert!(report.proofs.expression(proofs[0]).contains("view"));
 }
 
 #[test]

@@ -32,7 +32,7 @@ stn-validator design.stypes --exhaustive --max-depth 0 --max-types 20000
 | --- | --- | --- |
 | `--output PATH`, `-o PATH` | stdout | Destination for the report. |
 | `--max-depth N` | 2 | Nesting bound for synthesized collections and products. Explicit shapes and their subexpressions are always admitted. |
-| `--max-proofs N` | 5 | Maximum distinct equal-minimum-cost witnesses per feature. Must be positive. |
+| `--max-proofs N` | 5 | Maximum distinct normalized alternatives at minimum cost per feature. Must be positive. |
 | `--max-types N` | 20000 | Resource limit on the type universe. Must be positive. |
 | `--max-steps N` | 2000000 | Work budget shared by universe construction and proof search. Must be positive. |
 | `--exhaustive` | off | Enumerate the complete bounded constructor universe described below. |
@@ -40,6 +40,59 @@ stn-validator design.stypes --exhaustive --max-depth 0 --max-types 20000
 Exit codes: **0** all goals proved; **1** I/O failure; **2** invalid arguments,
 syntax or specification; **3** a goal is unresolved in the selected universe;
 **4** a resource limit prevented completion. A declarations-only file is valid.
+
+## Reading proofs
+
+Proved features are displayed as compositions of functions, with costs on a
+separate line. Short expressions fit on one line:
+
+```text
+  cost: functions=3, rules=3
+  run = Args.parse >>> extend(Args.run) >>> finish
+```
+
+Long pipelines put each outer step on its own line:
+
+```text
+  validate =
+      Args.parse
+      >>> extend(Args.loadInput)
+      >>> extend(validateSource)
+      >>> extend(ValidationReport.format)
+```
+
+`f >>> g` runs `f` followed by `g`. `f &&& g` obtains both results from the
+same logical input; it does not require independent calls on a mutable object.
+Mixed operators and nested fanouts use explicit parentheses, for example
+`h >>> (f &&& g)` and `(f &&& g) &&& h`. Composition chains are flattened;
+fanout grouping is preserved because it determines the product's structure.
+
+`extend(f)` applies `f` to the sum alternatives it handles and carries the
+other alternatives through unchanged. Its scope stays explicit:
+`extend(f >>> g)` is not unconditionally interchangeable with
+`extend(f) >>> extend(g)`; a later step might handle a carried alternative.
+Collection lifts use `mapList(f)`, `mapSet(f)`, `mapValues(f)`, and `flatMap(f)`.
+Structural steps remain visible as `id`, `view`, `project[1]` (one-based),
+`narrowList`, `narrowSet`, `narrowKeys`, and `restrictInput(f)`.
+
+Expressions omit type annotations, parameter substitutions, and declaration
+locations. Feature specialization names and failure diagnostics retain types
+where they identify the goal. Full typed witnesses and source metadata remain
+available through the library API and are used by the independent checker.
+The display is a readable summary, not a serialization of the typed evidence.
+
+Search retains one original witness per normalized composition. Composition
+associations and safe placements of `extend` share an alternative slot. An
+extension can move across a pipeline only when every later step leaves its
+carried variants untouched. Primitive specializations, operation order, fanout
+grouping, projections, and collection operations remain significant. The exact
+normalization procedure is defined in `doc.md` §8.1.
+
+The renderer also groups identical displayed definitions and costs: omitting
+types can make distinct normalized alternatives look alike. The `PROVED` count
+refers to retained representatives, and multiple displayed entries show how
+many representatives they contain. Each representative remains an original
+checked proof with its original cost.
 
 ## Search scope
 
@@ -79,8 +132,9 @@ witness produces `UNRESOLVABLE_WITHIN_BOUNDS`.
 
 Finite elaboration has an additional guard of 100000 specializations per
 parameter environment; exceeding it produces `EXPANSION_LIMIT` and exit code 4.
-The proof alternative limit truncates distinct trees deterministically; it does
-not count distinct runtime implementations.
+The proof alternative limit truncates normalized compositions deterministically
+during search, so equivalent trees do not occupy separate slots. This remains a
+bounded selection, not an enumeration of every distinct runtime implementation.
 
 ## Examples and the validator specification
 
@@ -144,7 +198,7 @@ independent validation runs. Use `report.types[id]` to inspect a node and
 `ValidationReport::proofs` owns the `ProofStore`. Feature results contain
 `ProofId` roots; inference children are identifiers in the same store.
 Use `report.proofs[id]` to inspect a record and
-`report.proofs.expression(id, &report.types)` to format a witness.
+`report.proofs.expression(id)` to format a witness as a single-line composition.
 `ProofStore` owns verification. Search uses `check_against` with already resolved
 declarations, checking rules, costs, primitive metadata, missing children, and
 cycles without reparsing source. `ProofChecker` owns temporary traversal marks.
@@ -194,13 +248,15 @@ reverse lookup, without rebuilding a vector and a separate lookup table.
 Lookup-only tables and membership-only sets use `HashMap` and `HashSet`.
 Traversed declaration and search collections use `IndexMap` and `IndexSet` for
 reproducible iteration. Parameter environments and proof substitutions retain
-`BTreeMap` for canonical name order in proof hashing and display.
+`BTreeMap` for canonical name order in proof hashing and feature specialization names.
 
 - `src/syntax.rs`: line lexer and recursive descent parser.
 - `src/model.rs`: interned type graph and declaration registry, finite elaboration, trait lowering,
   cycle detection, existential normalization and overload intersection checks.
 - `src/search.rs`: type-universe construction and an indexed weighted agenda.
 - `src/proof.rs`: typed proof nodes, inference premises and witness checking.
+- `src/proof/display.rs`: function-composition expressions and displayed alternatives.
+- `src/proof/normalize.rs`: typed equivalence keys for alternative selection.
 - `src/lib.rs`: validation API and report formatting.
 - `src/main.rs`: declarative `clap` arguments and command execution through `Result`,
   with contextual errors handled once at the program boundary.
@@ -215,6 +271,10 @@ lifts, input restriction, sum extension, composition, and fanout.
 The agenda implements generalized Dijkstra search over morphism pairs. It borrows
 the proof store and carries the remaining budget, so offering an inference handles
 endpoint translation, cost calculation, deduplication, and budget accounting together.
+Its `NormalForms` store interns typed composition keys and memoizes accepted
+premises. These keys are temporary search state; the returned proof DAG contains
+only original witnesses. Normalization reads the type store without interning
+virtual intermediate sums or changing the search universe.
 Unary rules and collection lifts are indexed by premise pairs; composition uses
 incoming/outgoing indexes and fanout uses admitted product targets. Every parent
 has greater lexicographic cost than either premise, so the first settled cost

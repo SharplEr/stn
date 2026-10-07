@@ -1,4 +1,9 @@
 //! Typed proof witnesses and a checker independent of the search agenda.
+mod display;
+mod normalize;
+
+pub(crate) use normalize::{NormalForms, NormalId};
+
 use crate::model::Primitive;
 use crate::{Type, TypeId, TypeStore};
 use indexmap::IndexSet;
@@ -87,7 +92,7 @@ pub enum ProofNode {
         line: usize,
         /// Preserved semantic description of the source morphism.
         description: String,
-        /// Concrete choices in name order for canonical node hashing and display.
+        /// Concrete choices in name order for canonical hashing and witness checking.
         substitutions: BTreeMap<String, TypeId>,
     },
     /// A structural step justified by zero, one, or two child proofs.
@@ -132,11 +137,6 @@ impl ProofStore {
     /// Look up a record using an identifier originating from this store.
     pub fn get(&self, id: ProofId) -> Option<&Proof> {
         self.nodes.get_index(id.0)
-    }
-
-    /// Find an existing record; child identifiers must belong to this store.
-    pub fn find(&self, proof: &Proof) -> Option<ProofId> {
-        self.nodes.get_index_of(proof).map(ProofId)
     }
 
     /// Store a record as supplied, reusing an identifier for an equal record.
@@ -189,50 +189,6 @@ impl ProofStore {
             output,
             cost,
             node: ProofNode::Inference { rule, children },
-        }
-    }
-
-    /// Format a well-formed witness, including typed endpoints and source locations.
-    /// Shared premises appear at every occurrence in the unfolded expression.
-    pub fn expression(&self, id: ProofId, types: &TypeStore) -> String {
-        let proof = &self[id];
-        match &proof.node {
-            ProofNode::Primitive {
-                name,
-                line,
-                substitutions,
-                ..
-            } => {
-                let args = if substitutions.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "<{}>",
-                        substitutions
-                            .iter()
-                            .map(|(n, t)| format!("{n}={}", types.display(*t)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
-                format!(
-                    "{name}{args}@{line}[{} -> {}]",
-                    types.display(proof.input),
-                    types.display(proof.output)
-                )
-            }
-            ProofNode::Inference { rule, children } => {
-                let args = children
-                    .iter()
-                    .map(|p| self.expression(*p, types))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "{rule}[{} -> {}]({args})",
-                    types.display(proof.input),
-                    types.display(proof.output)
-                )
-            }
         }
     }
 
@@ -459,8 +415,10 @@ impl ProofChecker<'_> {
         let cost = self.expected_cost(proof)?;
         if !valid || cost != proof.cost {
             return Err(format!(
-                "invalid proof node: {}",
-                self.proofs.expression(id, self.types)
+                "invalid proof node: {} [{} -> {}]",
+                self.proofs.expression(id),
+                self.types.display(proof.input),
+                self.types.display(proof.output)
             ));
         }
         Ok(())

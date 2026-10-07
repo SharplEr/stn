@@ -27,7 +27,7 @@ struct Args {
     /// Maximum nesting depth of synthesized collections and products
     #[arg(long, value_name = "N", default_value_t = ValidationOptions::default().max_depth)]
     max_depth: usize,
-    /// Maximum equal-minimum-cost proofs per feature
+    /// Maximum distinct normalized alternatives at minimum cost per feature
     #[arg(
         long, value_name = "N",
         default_value_t = ValidationOptions::default().max_proofs

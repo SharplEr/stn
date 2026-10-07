@@ -47,6 +47,11 @@ fn shared_proof_cost_overflow_is_reported_without_unfolding_the_dag() {
 }
 
 impl ProofStore {
+    /// Test-only lookup of an existing record; its children belong to this store.
+    fn find(&self, proof: &Proof) -> Option<ProofId> {
+        self.nodes.get_index_of(proof).map(ProofId)
+    }
+
     /// Number of proof records owned by the store.
     fn len(&self) -> usize {
         self.nodes.len()

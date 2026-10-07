@@ -35,7 +35,10 @@ fn cli_outputs_checked_proofs() {
         .unwrap();
     assert_code(&output, 0);
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("PROVED") && text.contains("[2, 3]") && text.contains("extendSum"));
+    assert!(text.contains("PROVED"));
+    assert!(text.contains("cost: functions=2, rules=3"));
+    assert!(text.contains("searchScores = matchDocs >>> extend(mapSet(score))"));
+    assert!(!text.contains(" -> ") && !text.contains('@'));
 }
 
 #[test]
