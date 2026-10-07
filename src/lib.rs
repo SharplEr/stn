@@ -109,6 +109,18 @@ pub struct FeatureReport {
     /// Checked witnesses or diagnostics for this ground goal.
     pub status: FeatureStatus,
 }
+/// Resource usage for one shared search over all features, including universe construction.
+/// Counters describe charged work and occupied capacity rather than proof-tree costs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SearchUsage {
+    /// Distinct types counted against the universe cap, up to its configured limit.
+    /// Includes collected explicit types even if universe construction is interrupted.
+    pub types: usize,
+    /// Work units consumed by universe construction, rule preparation, and proof search.
+    /// A failed attempt after exhaustion does not consume an additional unit.
+    pub steps: usize,
+}
+
 /// Validation results and search bounds for an entire specification.
 /// Its display representation is the text report written by the CLI.
 #[derive(Clone, Debug)]
@@ -123,6 +135,8 @@ pub struct ValidationReport {
     pub source_name: String,
     /// Universe profile and resource limits used for this validation run.
     pub options: ValidationOptions,
+    /// Accounted resource consumption, including work before an interrupted search.
+    pub usage: SearchUsage,
     /// Reports for all ground goals, in declaration and specialization order.
     pub features: Vec<FeatureReport>,
 }
@@ -156,6 +170,14 @@ impl fmt::Display for ValidationReport {
             self.options.max_proofs,
             self.options.max_types,
             self.options.max_steps
+        )?;
+        writeln!(
+            f,
+            "budget-used: types={} ({:.2}%), steps={} ({:.2}%)",
+            self.usage.types,
+            self.usage.types as f64 / self.options.max_types.get() as f64 * 100.0,
+            self.usage.steps,
+            self.usage.steps as f64 / self.options.max_steps.get() as f64 * 100.0
         )?;
         if !self.options.exhaustive {
             writeln!(

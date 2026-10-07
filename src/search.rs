@@ -1,6 +1,7 @@
 //! A finite type universe and a shortest-path agenda over inference hyperedges.
 use crate::{
-    FeatureReport, FeatureStatus, Type, TypeId, TypeStore, ValidationOptions, ValidationReport,
+    FeatureReport, FeatureStatus, SearchUsage, Type, TypeId, TypeStore, ValidationOptions,
+    ValidationReport,
     model::{Primitive, Specification},
     proof::{self, Cost, NormalForms, NormalId, Proof, ProofId, ProofStore, Rule},
 };
@@ -19,38 +20,44 @@ type LiftIndex = HashMap<Pair, Vec<(Pair, Rule)>>;
 
 /// Work allowance shared by type generation, rule indexing, and agenda operations.
 /// Exhaustion stops certification and yields an incomplete-search diagnostic.
-struct Budget {
-    /// Number of accounted work units that can still be consumed.
-    remaining: usize,
+struct Budget<'a> {
+    /// Configured caps; depth and other search choices stay with the same options.
+    options: &'a ValidationOptions,
+    /// Counters owned by the result, surviving early returns and resource exhaustion.
+    usage: &'a mut SearchUsage,
 }
-impl Budget {
+impl Budget<'_> {
     fn tick(&mut self) -> Result<(), String> {
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or("work limit reached; increase --max-steps")?;
+        if self.usage.steps >= self.options.max_steps.get() {
+            return Err("work limit reached; increase --max-steps".into());
+        }
+        self.usage.steps += 1;
         Ok(())
     }
-}
 
-/// Admit a new universe member without charging duplicates against the type cap.
-/// The bound applies to admitted search types, not every node interned in the store.
-fn insert_type(
-    known: &mut IndexSet<TypeId>,
-    ty: TypeId,
-    options: &ValidationOptions,
-) -> Result<bool, String> {
-    if known.contains(&ty) {
-        return Ok(false);
+    /// Record occupied type capacity while collecting explicit types in batches.
+    /// An oversized batch fills the cap and stops construction; excess types are
+    /// not admitted to a proof-search universe and do not count as budget usage.
+    fn record_types(&mut self, count: usize) {
+        self.usage.types = count.min(self.options.max_types.get());
     }
-    if known.len() >= options.max_types.get() {
-        return Err(format!(
-            "type limit ({}) reached; increase --max-types",
-            options.max_types
-        ));
+
+    /// Admit a new universe member without charging duplicates against the type cap.
+    /// The bound applies to admitted search types, not every interned type node.
+    fn insert_type(&mut self, known: &mut IndexSet<TypeId>, ty: TypeId) -> Result<bool, String> {
+        if known.contains(&ty) {
+            return Ok(false);
+        }
+        if known.len() >= self.options.max_types.get() {
+            return Err(format!(
+                "type limit ({}) reached; increase --max-types",
+                self.options.max_types
+            ));
+        }
+        known.insert(ty);
+        self.record_types(known.len());
+        Ok(true)
     }
-    known.insert(ty);
-    Ok(true)
 }
 
 /// Collect all ground declarations, callable endpoints, feature goals, and their
@@ -61,21 +68,24 @@ fn explicit_types(
     primitives: &[Primitive],
     features: &[Primitive],
     types: &mut TypeStore,
-    options: &ValidationOptions,
+    budget: &mut Budget<'_>,
 ) -> Result<IndexSet<TypeId>, String> {
     let mut out = IndexSet::new();
     for p in primitives.iter().chain(features) {
         types.collect(p.input, &mut out);
         types.collect(p.output, &mut out);
     }
-    types.collect_declarations(&mut out, options.max_types.get())?;
+    let declarations = types.collect_declarations(&mut out, budget.options.max_types.get());
+    budget.record_types(out.len());
+    declarations?;
     // Include direct nominal bodies recursively, including predefined Bytes.
     loop {
         let before = out.len();
         for t in out.clone() {
             types.collect(types.shape(t), &mut out);
         }
-        if out.len() > options.max_types.get() {
+        budget.record_types(out.len());
+        if out.len() > budget.options.max_types.get() {
             return Err("explicit types exceed --max-types".into());
         }
         if before == out.len() {
@@ -113,7 +123,7 @@ fn relevant_universe(
     primitives: &[Primitive],
     types: &mut TypeStore,
     options: &ValidationOptions,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
 ) -> Result<IndexSet<TypeId>, String> {
     let mut known = explicit.clone();
     let mut steps = structural_steps(explicit, types);
@@ -210,7 +220,7 @@ fn relevant_universe(
         steps.extend(new_steps);
         let mut changed = false;
         for t in additions {
-            changed |= insert_type(&mut known, t, options)?;
+            changed |= budget.insert_type(&mut known, t)?;
         }
         if !changed && old_steps == steps.len() {
             return Ok(known);
@@ -244,8 +254,7 @@ fn add_sums(
     known: &mut IndexSet<TypeId>,
     candidates: &[TypeId],
     types: &mut TypeStore,
-    options: &ValidationOptions,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
 ) -> Result<(), String> {
     // Incremental powerset generation has no word-size-dependent bit masks.
     let mut sums = IndexSet::<TypeId>::new();
@@ -256,7 +265,7 @@ fn add_sums(
             next.push(types.union(vec![sum, atom]));
         }
         for sum in next {
-            insert_type(known, sum, options)?;
+            budget.insert_type(known, sum)?;
             sums.insert(sum);
         }
     }
@@ -271,17 +280,17 @@ fn exhaustive_universe(
     explicit: &IndexSet<TypeId>,
     types: &mut TypeStore,
     options: &ValidationOptions,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
     arity: usize,
 ) -> Result<IndexSet<TypeId>, String> {
     let mut known = explicit.clone();
-    insert_type(&mut known, types.intern(Type::Unit), options)?;
+    budget.insert_type(&mut known, types.intern(Type::Unit))?;
     let atoms = known
         .iter()
         .copied()
         .filter(|t| matches!(types[*t], Type::Named(..) | Type::Exists(..) | Type::Unit))
         .collect::<Vec<_>>();
-    add_sums(&mut known, &atoms, types, options, budget)?;
+    add_sums(&mut known, &atoms, types, budget)?;
     for depth in 1..=options.max_depth {
         let inner = known
             .iter()
@@ -290,11 +299,11 @@ fn exhaustive_universe(
             .collect::<Vec<_>>();
         for &a in &inner {
             budget.tick()?;
-            insert_type(&mut known, types.intern(Type::List(a)), options)?;
-            insert_type(&mut known, types.intern(Type::Set(a)), options)?;
+            budget.insert_type(&mut known, types.intern(Type::List(a)))?;
+            budget.insert_type(&mut known, types.intern(Type::Set(a)))?;
             for &b in &inner {
                 budget.tick()?;
-                insert_type(&mut known, types.intern(Type::Map(a, b)), options)?;
+                budget.insert_type(&mut known, types.intern(Type::Map(a, b)))?;
             }
         }
         let mut tuples = vec![Vec::new()];
@@ -306,11 +315,8 @@ fn exhaustive_universe(
                     let mut tuple = prefix.clone();
                     tuple.push(t);
                     if width >= 2 {
-                        insert_type(
-                            &mut known,
-                            types.intern(Type::Product(tuple.clone())),
-                            options,
-                        )?;
+                        budget
+                            .insert_type(&mut known, types.intern(Type::Product(tuple.clone())))?;
                     }
                     next.push(tuple);
                 }
@@ -322,7 +328,7 @@ fn exhaustive_universe(
             .copied()
             .filter(|t| !matches!(types[*t], Type::Sum(_)) && types.depth(*t) <= depth)
             .collect::<Vec<_>>();
-        add_sums(&mut known, &nonsums, types, options, budget)?;
+        add_sums(&mut known, &nonsums, types, budget)?;
     }
     Ok(known)
 }
@@ -336,7 +342,7 @@ struct Agenda<'a> {
     /// Shared storage for pending and settled proof records.
     proofs: &'a mut ProofStore,
     /// Work allowance remaining after universe construction.
-    budget: Budget,
+    budget: Budget<'a>,
     /// Maximum normalized alternatives offered at the best cost for each pair.
     limit: usize,
     /// Minimum-cost queue; proof records live exclusively in the proof store.
@@ -352,7 +358,7 @@ impl<'a> Agenda<'a> {
     fn new(
         universe: &'a SearchUniverse,
         proofs: &'a mut ProofStore,
-        budget: Budget,
+        budget: Budget<'a>,
         limit: usize,
     ) -> Self {
         Self {
@@ -440,6 +446,8 @@ pub(crate) struct SearchResult {
     tuple_arity: usize,
     /// Universe profile and resource limits used to obtain these outcomes.
     options: ValidationOptions,
+    /// Accounted work and type capacity, retained even when a run is interrupted.
+    usage: SearchUsage,
 }
 
 impl SearchResult {
@@ -503,6 +511,7 @@ impl SearchResult {
             max_tuple_arity: self.tuple_arity,
             source_name: source_name.into(),
             options: self.options,
+            usage: self.usage,
             features,
         }
     }
@@ -520,6 +529,7 @@ pub(crate) fn search(specification: Specification, options: ValidationOptions) -
         features,
     } = specification;
     let mut proofs = ProofStore::default();
+    let mut usage = SearchUsage::default();
     let statuses = run(
         &primitives,
         &features,
@@ -527,6 +537,7 @@ pub(crate) fn search(specification: Specification, options: ValidationOptions) -
         &mut proofs,
         &options,
         tuple_arity,
+        &mut usage,
     )
     .unwrap_or_else(|reason| incomplete_statuses(features.len(), reason));
     let mut result = SearchResult {
@@ -536,6 +547,7 @@ pub(crate) fn search(specification: Specification, options: ValidationOptions) -
         statuses,
         tuple_arity,
         options,
+        usage,
     };
     result.retain_feature_proofs();
     result
@@ -564,9 +576,9 @@ impl SearchUniverse {
         types: &mut TypeStore,
         options: &ValidationOptions,
         tuple_arity: usize,
-        budget: &mut Budget,
+        budget: &mut Budget<'_>,
     ) -> Result<Self, String> {
-        let explicit = explicit_types(primitives, features, types, options)?;
+        let explicit = explicit_types(primitives, features, types, budget)?;
         let mut members = if options.exhaustive {
             exhaustive_universe(&explicit, types, options, budget, tuple_arity)?
         } else {
@@ -693,7 +705,7 @@ impl<'a> ProofSearch<'a> {
         universe: &'a SearchUniverse,
         types: &'a mut TypeStore,
         proofs: &'a mut ProofStore,
-        budget: Budget,
+        budget: Budget<'a>,
         max_proofs: usize,
     ) -> Self {
         let type_count = universe.members.len();
@@ -967,13 +979,12 @@ fn run(
     proofs: &mut ProofStore,
     options: &ValidationOptions,
     tuple_arity: usize,
+    usage: &mut SearchUsage,
 ) -> Result<Vec<FeatureStatus>, String> {
     if features.is_empty() {
         return Ok(Vec::new());
     }
-    let mut budget = Budget {
-        remaining: options.max_steps.get(),
-    };
+    let mut budget = Budget { options, usage };
     let universe = SearchUniverse::build(
         primitives,
         features,

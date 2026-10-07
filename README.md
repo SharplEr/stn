@@ -43,6 +43,22 @@ syntax or specification; **3** a goal is unresolved in the selected universe;
 
 ## Reading proofs
 
+The report header includes resource consumption, for example:
+
+```text
+budget-used: types=42 (0.21%), steps=14291 (0.71%)
+```
+
+Percentages use the configured `--max-types` and `--max-steps` limits. These
+counters cover the entire shared search, including universe construction and
+rule preparation, and survive an interrupted run. Types count occupied universe
+capacity without duplicates; collecting an oversized explicit batch reports a
+full type cap. Extra interned nodes and virtual normalization boundaries do not
+consume that capacity. Steps count successfully charged work units; an attempt
+after exhaustion does not increment the counter. With no features, search is
+skipped and both counters are zero. The library exposes them as
+`ValidationReport::usage` (`SearchUsage`).
+
 Proved features are displayed as compositions of functions, with costs on a
 separate line. Short expressions fit on one line:
 
