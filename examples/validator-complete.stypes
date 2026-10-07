@@ -1,87 +1,164 @@
-// Описание валидатора Semantic Types Notation
+// High-level architecture of the Semantic Types Notation validator.
+// Operations describe logical data flow; storage and borrowing are implementation details.
 DEFINITIONS:
 
-/// аргументы командной строки
-Args
+/// Raw command-line arguments, including platform-native file paths.
+CommandLine
 
-/// Максимальная глубина промежуточных структур которые можно создавать при поиске доказательства
+/// Maximum nesting depth of synthesized intermediate collections and products; zero is valid.
 MaxDepth
-
-/// Максимальное число альтернативных доказательств которые можно выдавать для одной фичи
+/// Positive maximum number of equal-minimum-cost proof alternatives retained per type pair.
 MaxProofs
+/// Positive maximum number of types admitted to the search universe.
+MaxTypes
+/// Positive work budget shared by universe construction and proof search.
+MaxSteps
 
-ValidatorConfig = (MaxDepth, MaxProofs)
+/// Search the universe generated from declarations and relevant transformations.
+Relevant
+/// Enumerate the complete constructor universe within the configured bounds.
+Exhaustive
+SearchProfile = Relevant | Exhaustive
 
-/// Путь к файлу в файловой системе
-InputPath
+/// Validated search bounds and the selected universe profile.
+ValidationOptions = (MaxDepth, MaxProofs, MaxTypes, MaxSteps, SearchProfile)
 
-/// Выходной файл
+/// Platform-native path of the input specification.
+InputPath:
+    sourceName: SourceName
+
+/// Platform-native path of an output file.
 OutputPath
+/// Marker selecting standard output instead of a file.
+StandardOutput
+OutputDestination = OutputPath | StandardOutput
 
-/// Конфигурация
-Config = (ValidatorConfig, InputPath, OutputPath)
+/// Invalid command-line syntax or an invalid option value.
+ArgumentError
 
-/// Ошибка конфигурации
-ConfigError
+/// Validated command-line configuration; numeric limits are checked before reading files.
+Args:
+    input: InputPath
+    output: OutputDestination
+    options: ValidationOptions
 
-/// парсинг конфигурации
-parseConfig: Args -> Config | ConfigError
+    /// Read the configured file while retaining its source label and validated search options.
+    loadInput: () -> ValidationInput | IOError
 
-/// Ошибка ввода-вывода
+    /// Format the report and write it to the output destination held in these arguments.
+    writeReport: ValidationReport -> () | IOError
+
+    /// Read and validate the specification, write its report, then select the report exit code.
+    /// Retain the output destination across validation and the report until writing succeeds.
+    /// Validation failures bypass report writing; unresolved and incomplete reports are written.
+    run: () -> ExitCode | CliError
+
+/// Parse flags and paths, apply defaults, and validate numeric limits.
+Args.parse: CommandLine -> Args | ArgumentError
+// Help and version requests are handled by the argument parser before validation.
+
+/// Input label used in diagnostics and report headings, normally the displayed input path.
+SourceName = String
+/// Owned UTF-8 specification text; preprocessing lazily borrows significant source lines.
+SourceText:
+    /// Parse the source into a document; semantic declaration checks are a separate stage.
+    parse: () -> Document | ParsingError
+
+/// A file or standard-stream operation failed, including invalid UTF-8 input.
 IOError
 
-/// Строка которую будут пытаться интерпретировать как Semantic Types Notation описание.
-StypesString = String
+readSource: InputPath -> SourceText | IOError
 
-/// Чтение файла.
-readStypesFile: InputPath -> StypesString | IOError
+/// Parsed nominal type declaration, including finite parameters and an optional body.
+TypeDecl
+/// Parsed standalone function signature and its semantic description.
+FunctionDecl
+/// Parsed trait header and its ordered member declarations.
+TraitDecl
+/// Parsed feature signature; features are goals and never available morphisms.
+FeatureDecl
 
-/// Запись из секции DEFINITIONS
-Definition
+/// Parsed document retaining declaration order, semantic descriptions, and source positions.
+Document:
+    types: List<TypeDecl>
+    functions: List<FunctionDecl>
+    traits: List<TraitDecl>
+    features: List<FeatureDecl>
 
-/// Запись из секции FEATURES
-Feature
-
-
-/// AST для Semantic Types Notation формата
-StypesAst:
-	definitions: Set<Definition>
-	features: Set<Feature>
-
-/// Ошибка парсинга Semantic Types Notation формата
+/// A syntax or indentation error with its physical line and column.
 ParsingError
 
+/// Invalid names, type contracts, dependency cycles, parameter domains, or overloads.
+InvalidSpecification
+/// Finite specialization exceeded the elaboration safety limit of 100000 environments.
+ExpansionLimit
+/// Library failure preserving the particular parsing, declaration, or specialization error.
+ValidationError = ParsingError | InvalidSpecification | ExpansionLimit
 
-/// Парсит строку в AST и проверяет его корректность, но без доказательств
-parseStypes: StypesString -> StypesAst | ParsingError
+/// Checked declarations: a type store, ground morphisms, ordered ground feature goals,
+/// and the tuple-width bound inferred after finite specialization and trait lowering.
+/// The type store owns semantic nodes, nominal declarations, and structural views.
+Specification
 
-/// Доказательство разрешимости
-Proof
+/// Consume the document, validate declarations, specialize parameters, and lower traits.
+elaborate: Document -> Specification | InvalidSpecification | ExpansionLimit
 
-/// Ошибка в случае если доказать не удается
-ProofError
+/// Identifier of a witness in the owning proof store.
+ProofId
+/// Retained, independently checked equal-minimum-cost witnesses in the selected universe.
+Proved = List<ProofId>
+/// No derivation exists in the selected universe; includes a reason and reachable-type sample.
+UnresolvableWithinUniverse
+/// A resource limit or failed witness check prevented certification; includes a reason.
+SearchIncomplete
+FeatureStatus = Proved | UnresolvableWithinUniverse | SearchIncomplete
 
+/// Results of one shared search: ordered goals and matching statuses, search options,
+/// the inferred tuple-width bound, and the owning type and proof stores.
+/// Witness IDs refer to a shared proof DAG retained with the results.
+SearchResult:
+    /// Pair each ground feature with its status and format its parameter substitutions.
+    intoReport: SourceName -> ValidationReport
 
-/// Пытается найти доказательства для фичи
-findProofs: (ValidatorConfig, Set<Definition>, Feature) -> Set<Proof> | ProofError
+/// Consume the specification and options, build the bounded universe, and solve all goals.
+/// Verify witnesses and compact their DAG; interruption marks every feature incomplete.
+/// Unresolved and incomplete searches return statuses rather than validation errors.
+search: (Specification, ValidationOptions) -> SearchResult
 
-/// Форматирует все доказательства или ошибки доказательств в выходную строку.
-/// Для стабильности вывода все коллекции должны сохранять порядок при превращении в строки
-formatProofs: Map<Feature, (Set<Proof> | ProofError)> -> OutputString
+/// Ordered feature reports with signatures, source positions, specialized names, and statuses;
+/// also retains the source label, search bounds, and the owning type and proof stores.
+ValidationReport:
+    /// Render features and equal-cost witnesses deterministically in their retained order.
+    format: () -> OutputString
+    /// Select 4 for incomplete search, otherwise 3 for unresolved goals, otherwise 0.
+    exitCode: ExitCode
 
-/// Результаты доказательств
+/// Report text containing the source label, search bounds, witnesses, and failure diagnostics.
 OutputString = String
 
-/// Запись результатов работы в файл, возможно в терминал
-writeOutput: (OutputString, OutputPath) -> () | IOError
+/// Process exit status: 0 proved, 1 I/O failure, 2 invalid input, 3 unresolved, 4 resource limit.
+ExitCode
 
-// Explicit orchestration needed because product/sum distribution and keyed
-// aggregation are not implicit rules in STN.
-/// Load and parse the input while retaining the proof-search configuration.
-loadSpecification: Config -> (ValidatorConfig, StypesAst) | IOError | ParsingError
-/// Check every feature against definitions and keep each result under its feature key.
-proveAllFeatures: (ValidatorConfig, StypesAst) -> Map<Feature, (Set<Proof> | ProofError)>
+// Explicit orchestration retains context across fallible stages. STN does not
+// implicitly distribute products over sums, aggregate keyed results, or sequence effects.
+
+/// Input text together with the source label and search options needed by the library.
+ValidationInput = (SourceName, SourceText, ValidationOptions)
+/// Parse, elaborate, search, and construct the report while retaining options and source label.
+/// Consume the source and options; declaration failures abort before proof search.
+validateSource: ValidationInput -> ValidationReport | ValidationError
+
+/// CLI failure retaining the affected input or output path and the underlying error.
+CliError = IOError | ValidationError
+
+/// At the process boundary, print failures and translate them into exit codes.
+/// Argument, parse, and declaration errors map to 2; expansion limits map to 4; I/O errors to 1.
+finish: ExitCode | ArgumentError | CliError -> ExitCode
 
 FEATURES:
 
-validate: Args -> OutputString | IOError | ConfigError | ParsingError
+/// Produce a validation report as text, preserving command-line, input, and declaration failures.
+validate: CommandLine -> OutputString | ArgumentError | IOError | ValidationError
+
+/// Execute the CLI: write successful validation reports, print failures, and return an exit code.
+run: CommandLine -> ExitCode

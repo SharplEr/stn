@@ -96,10 +96,13 @@ The rules do not introduce keyed aggregation, distribute products over sums,
 or construct arbitrary flat argument tuples.
 
 [examples/validator-complete.stypes](examples/validator-complete.stypes) keeps
-those operations explicit using two additional orchestration morphisms:
-`loadSpecification` retains configuration while loading/parsing, and
-`proveAllFeatures` collects the per-feature results. Its feature is proved with
-cost `(4, 5)` in the relevant universe. The original specification is preserved.
+the current architecture explicit: command-line validation, input loading,
+syntax parsing, semantic elaboration, shared proof search, report formatting,
+output writing, and exit-status selection. `Args.loadInput`, `validateSource`, and
+`Args.run` retain context and sequence the fallible stages. Unresolved and
+incomplete searches become feature statuses in the report; library and I/O
+failures propagate to the process boundary. Its `validate` and `run` features
+are proved with costs `(4, 6)` and `(3, 3)` in the relevant universe.
 These declarations express implementation obligations; the validator does not
 execute the specified functions.
 
