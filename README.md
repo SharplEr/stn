@@ -41,6 +41,13 @@ Exit codes: **0** all goals proved; **1** I/O failure; **2** invalid arguments,
 syntax or specification; **3** a goal is unresolved in the selected universe;
 **4** a resource limit prevented completion. A declarations-only file is valid.
 
+## Editor highlighting
+
+[editors/STN.tmbundle](editors/STN.tmbundle) provides TextMate syntax highlighting
+for `.stypes` files. In Sublime Text, choose **Preferences → Browse Packages…**
+and copy that directory into the opened Packages directory. The same grammar can
+be used in IntelliJ IDEA and VS Code; see [editor setup](editors/README.md).
+
 ## Reading proofs
 
 The report header includes resource consumption, for example:

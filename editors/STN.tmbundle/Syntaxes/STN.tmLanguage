@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>name</key>
+    <string>Semantic Types Notation</string>
+    <key>scopeName</key>
+    <string>source.stn</string>
+    <key>fileTypes</key>
+    <array><string>stypes</string></array>
+    <key>uuid</key>
+    <string>451169D0-4438-42A1-9D58-24042E6EA2D3</string>
+    <key>patterns</key>
+    <array>
+        <!-- Descriptions are documentation only at the start of a physical line.
+             Inline /// follows the ordinary // comment rule. -->
+        <dict>
+            <key>match</key><string>^[ \t]*(///).*$</string>
+            <key>name</key><string>comment.line.documentation.stn</string>
+            <key>captures</key>
+            <dict><key>1</key><dict><key>name</key><string>punctuation.definition.comment.stn</string></dict></dict>
+        </dict>
+        <dict>
+            <key>match</key><string>(//).*$</string>
+            <key>name</key><string>comment.line.double-slash.stn</string>
+            <key>captures</key>
+            <dict><key>1</key><dict><key>name</key><string>punctuation.definition.comment.stn</string></dict></dict>
+        </dict>
+        <dict>
+            <key>match</key><string>^(DEFINITIONS|FEATURES)(:)(?=[ \t]*(?://|$))</string>
+            <key>captures</key>
+            <dict>
+                <key>1</key><dict><key>name</key><string>keyword.control.section.stn</string></dict>
+                <key>2</key><dict><key>name</key><string>punctuation.separator.section.stn</string></dict>
+            </dict>
+        </dict>
+
+        <!-- Declaration patterns consume only the name. The lookaheads tolerate
+             nested parameter domains without swallowing their highlighting. -->
+        <dict>
+            <key>match</key><string>^([A-Za-z_][A-Za-z0-9_]*)(?=[ \t]*(?:&lt;[^/\r\n]*&gt;)?[ \t]*:[ \t]*(?://|$))</string>
+            <key>captures</key>
+            <dict><key>1</key><dict><key>name</key><string>entity.name.type.trait.stn</string></dict></dict>
+        </dict>
+        <dict>
+            <key>match</key><string>^([A-Za-z_][A-Za-z0-9_]*(?:[ \t]*\.[ \t]*[A-Za-z_][A-Za-z0-9_]*)*)(?=[ \t]*(?:&lt;[^/\r\n]*&gt;)?[ \t]*:)</string>
+            <key>captures</key>
+            <dict><key>1</key><dict><key>name</key><string>entity.name.function.stn</string></dict></dict>
+        </dict>
+        <dict>
+            <key>match</key><string>^([ \t]+)([A-Za-z_][A-Za-z0-9_]*)(?=[ \t]*(?:&lt;[^/\r\n]*&gt;)?[ \t]*:)</string>
+            <key>captures</key>
+            <dict><key>2</key><dict><key>name</key><string>entity.name.function.member.stn</string></dict></dict>
+        </dict>
+        <dict>
+            <key>match</key><string>^([A-Za-z_][A-Za-z0-9_]*)(?=[ \t]*(?:&lt;|=|//|$))</string>
+            <key>captures</key>
+            <dict><key>1</key><dict><key>name</key><string>entity.name.type.stn</string></dict></dict>
+        </dict>
+
+        <!-- Binders are identified by grammar position, not by capitalization. -->
+        <dict>
+            <key>match</key><string>\b[A-Za-z_][A-Za-z0-9_]*(?=[ \t]+from\b)</string>
+            <key>name</key><string>variable.parameter.type.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\b(?:exists|from)\b</string>
+            <key>name</key><string>keyword.declaration.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\b(?:Boolean|Int8|Int16|Int32|Int64|UInt8|UInt16|UInt32|UInt64|Byte|Float32|Float64|None|String|Bytes|List|Set|Map)\b</string>
+            <key>name</key><string>support.type.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\b[A-Za-z_][A-Za-z0-9_]*\b</string>
+            <key>name</key><string>entity.name.type.stn</string>
+        </dict>
+
+        <!-- Match the arrow before generic-closing punctuation. -->
+        <dict>
+            <key>match</key><string>-&gt;</string>
+            <key>name</key><string>keyword.operator.arrow.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>=</string>
+            <key>name</key><string>keyword.operator.definition.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\|</string>
+            <key>name</key><string>keyword.operator.union.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\([ \t]*\)</string>
+            <key>name</key><string>constant.language.unit.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\(</string>
+            <key>name</key><string>punctuation.section.group.begin.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\)</string>
+            <key>name</key><string>punctuation.section.group.end.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>&lt;</string>
+            <key>name</key><string>punctuation.definition.generic.begin.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>&gt;</string>
+            <key>name</key><string>punctuation.definition.generic.end.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>:</string>
+            <key>name</key><string>punctuation.separator.type.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>,</string>
+            <key>name</key><string>punctuation.separator.sequence.stn</string>
+        </dict>
+        <dict>
+            <key>match</key><string>\.</string>
+            <key>name</key><string>punctuation.accessor.stn</string>
+        </dict>
+    </array>
+</dict>
+</plist>

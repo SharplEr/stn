@@ -1,0 +1,9 @@
+{
+    "rules": [
+        {
+            "name": "STN functions and methods",
+            "scope": "source.stn entity.name.function",
+            "foreground": "#8BD5FF"
+        }
+    ]
+}
